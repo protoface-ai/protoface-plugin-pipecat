@@ -1,0 +1,306 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from collections.abc import AsyncIterator, Coroutine, Mapping
+from typing import Any
+
+import pytest
+from pipecat.frames.frames import (
+    CancelFrame,
+    EndFrame,
+    OutputImageRawFrame,
+    OutputTransportReadyFrame,
+    SpeechOutputAudioRawFrame,
+    StartFrame,
+    TTSAudioRawFrame,
+    TTSStoppedFrame,
+    UserStartedSpeakingFrame,
+)
+from pipecat.processors.frame_processor import FrameDirection
+from pipecat_protoface import ProtofaceVideoService
+from pipecat_protoface._client import (
+    ProtofaceAudioFrame,
+    ProtofaceMediaClient,
+    ProtofaceVideoFrame,
+)
+from pipecat_protoface.video import _to_pipecat_audio_frame, _to_pipecat_video_frame
+
+
+class FakeMediaClient:
+    input_sample_rate = 16_000
+
+    def __init__(self, *, start_delay: float = 0.0) -> None:
+        self.start_delay = start_delay
+        self.started: dict[str, object] | None = None
+        self.sent_audio: list[tuple[bytes, int, int]] = []
+        self.flushed = 0
+        self.interrupted = 0
+        self.stopped = 0
+        self.canceled = 0
+        self._audio: asyncio.Queue[ProtofaceAudioFrame | None] = asyncio.Queue()
+        self._video: asyncio.Queue[ProtofaceVideoFrame | None] = asyncio.Queue()
+
+    async def start(
+        self,
+        *,
+        avatar_id: str,
+        max_duration_seconds: int | None = None,
+        metadata: Mapping[str, str | int | float | bool | None] | None = None,
+    ) -> str:
+        if self.start_delay:
+            await asyncio.sleep(self.start_delay)
+        self.started = {
+            "avatar_id": avatar_id,
+            "max_duration_seconds": max_duration_seconds,
+            "metadata": dict(metadata or {}),
+        }
+        return "sess_test"
+
+    async def stop(self) -> None:
+        self.stopped += 1
+
+    async def cancel(self) -> None:
+        self.canceled += 1
+
+    async def send_audio(self, audio: bytes, *, sample_rate: int, num_channels: int) -> None:
+        self.sent_audio.append((audio, sample_rate, num_channels))
+
+    async def flush_audio(self) -> None:
+        self.flushed += 1
+
+    async def interrupt(self) -> None:
+        self.interrupted += 1
+
+    async def push_audio(self, frame: ProtofaceAudioFrame) -> None:
+        await self._audio.put(frame)
+
+    async def push_video(self, frame: ProtofaceVideoFrame) -> None:
+        await self._video.put(frame)
+
+    async def close_streams(self) -> None:
+        await self._audio.put(None)
+        await self._video.put(None)
+
+    async def audio_frames(self) -> AsyncIterator[ProtofaceAudioFrame]:
+        while True:
+            frame = await self._audio.get()
+            if frame is None:
+                return
+            yield frame
+
+    async def video_frames(self) -> AsyncIterator[ProtofaceVideoFrame]:
+        while True:
+            frame = await self._video.get()
+            if frame is None:
+                return
+            yield frame
+
+
+class TestableProtofaceVideoService(ProtofaceVideoService):
+    __test__ = False
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.pushed: list[object] = []
+
+    def create_task(
+        self,
+        coroutine: Coroutine[Any, Any, Any],
+        *args: object,
+        **kwargs: object,
+    ) -> asyncio.Task[Any]:
+        del args, kwargs
+        return asyncio.create_task(coroutine)
+
+    async def cancel_task(self, task: asyncio.Task[Any], timeout: float | None = 1.0) -> None:
+        del timeout
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def push_frame(
+        self,
+        frame: object,
+        direction: FrameDirection = FrameDirection.DOWNSTREAM,
+    ) -> None:
+        del direction
+        self.pushed.append(frame)
+
+
+async def _wait_until(predicate: object, *, timeout: float = 1.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if predicate():  # type: ignore[operator]
+            return
+        await asyncio.sleep(0.01)
+    assert predicate()  # type: ignore[operator]
+
+
+def test_fake_client_satisfies_protocol() -> None:
+    client: ProtofaceMediaClient = FakeMediaClient()
+    assert client.input_sample_rate == 16_000
+
+
+def test_audio_frame_conversion() -> None:
+    frame = _to_pipecat_audio_frame(
+        ProtofaceAudioFrame(
+            audio=b"\x00\x01",
+            sample_rate=16_000,
+            num_channels=1,
+            transport_source="protoface",
+        )
+    )
+
+    assert isinstance(frame, SpeechOutputAudioRawFrame)
+    assert frame.audio == b"\x00\x01"
+    assert frame.sample_rate == 16_000
+    assert frame.num_channels == 1
+    assert frame.transport_source == "protoface"
+
+
+def test_video_frame_conversion() -> None:
+    frame = _to_pipecat_video_frame(
+        ProtofaceVideoFrame(
+            image=b"rgb",
+            size=(1, 1),
+            format="RGB",
+            pts=123,
+            transport_source="protoface",
+        )
+    )
+
+    assert isinstance(frame, OutputImageRawFrame)
+    assert frame.image == b"rgb"
+    assert frame.size == (1, 1)
+    assert frame.format == "RGB"
+    assert frame.pts == 123
+    assert frame.transport_source == "protoface"
+
+
+@pytest.mark.asyncio
+async def test_tts_audio_frame_shape_matches_pipecat() -> None:
+    frame = TTSAudioRawFrame(audio=b"\x00\x00" * 160, sample_rate=16_000, num_channels=1)
+    assert frame.num_frames == 160
+
+
+@pytest.mark.asyncio
+async def test_service_starts_and_stops_media_client() -> None:
+    client = FakeMediaClient()
+    service = TestableProtofaceVideoService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        max_duration_seconds=120,
+        metadata={"customer_session_id": "abc"},
+        media_client=client,
+    )
+
+    await service.start(StartFrame())
+    await _wait_until(lambda: client.started is not None)
+    assert client.started == {
+        "avatar_id": "av_demo",
+        "max_duration_seconds": 120,
+        "metadata": {"customer_session_id": "abc"},
+    }
+
+    await client.close_streams()
+    await service.stop(EndFrame())
+    assert client.flushed == 1
+    assert client.stopped == 1
+
+
+@pytest.mark.asyncio
+async def test_service_emits_avatar_media_after_transport_ready() -> None:
+    client = FakeMediaClient()
+    service = TestableProtofaceVideoService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+    )
+
+    await service.start(StartFrame())
+    await service.process_frame(OutputTransportReadyFrame(), FrameDirection.DOWNSTREAM)
+    await client.push_audio(ProtofaceAudioFrame(audio=b"\x00\x01", sample_rate=16_000))
+    await client.push_video(ProtofaceVideoFrame(image=b"rgb", size=(1, 1), pts=12))
+
+    await _wait_until(
+        lambda: (
+            any(isinstance(frame, SpeechOutputAudioRawFrame) for frame in service.pushed)
+            and any(isinstance(frame, OutputImageRawFrame) for frame in service.pushed)
+        )
+    )
+    await client.close_streams()
+    await service.cancel(CancelFrame())
+
+
+@pytest.mark.asyncio
+async def test_service_chunks_audio_and_interrupts() -> None:
+    client = FakeMediaClient()
+    service = TestableProtofaceVideoService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+    )
+
+    await service.start(StartFrame())
+    await service.process_frame(
+        TTSAudioRawFrame(audio=b"\x00\x00" * 640, sample_rate=16_000, num_channels=1),
+        FrameDirection.DOWNSTREAM,
+    )
+    await _wait_until(lambda: bool(client.sent_audio))
+
+    assert client.sent_audio == [(b"\x00\x00" * 640, 16_000, 1)]
+
+    await service.process_frame(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    assert client.interrupted == 1
+
+    await client.close_streams()
+    await service.cancel(CancelFrame())
+
+
+@pytest.mark.asyncio
+async def test_service_buffers_tts_until_media_client_is_ready() -> None:
+    client = FakeMediaClient(start_delay=0.05)
+    service = TestableProtofaceVideoService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+    )
+
+    await service.start(StartFrame())
+    await service.process_frame(
+        TTSAudioRawFrame(audio=b"\x00\x00" * 640, sample_rate=16_000, num_channels=1),
+        FrameDirection.DOWNSTREAM,
+    )
+
+    assert client.sent_audio == []
+    await _wait_until(lambda: bool(client.sent_audio))
+    assert client.sent_audio == [(b"\x00\x00" * 640, 16_000, 1)]
+
+    await client.close_streams()
+    await service.cancel(CancelFrame())
+
+
+@pytest.mark.asyncio
+async def test_service_flushes_leftover_audio_with_original_channels() -> None:
+    client = FakeMediaClient()
+    service = TestableProtofaceVideoService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+    )
+
+    await service.start(StartFrame())
+    await service.process_frame(
+        TTSAudioRawFrame(audio=b"\x00\x00" * 160 * 2, sample_rate=16_000, num_channels=2),
+        FrameDirection.DOWNSTREAM,
+    )
+    assert client.sent_audio == []
+
+    await service.process_frame(TTSStoppedFrame(), FrameDirection.DOWNSTREAM)
+    await _wait_until(lambda: bool(client.sent_audio))
+
+    assert client.sent_audio == [(b"\x00\x00" * 160 * 2, 16_000, 2)]
+
+    await client.close_streams()
+    await service.cancel(CancelFrame())

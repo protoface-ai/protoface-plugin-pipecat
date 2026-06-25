@@ -1,0 +1,81 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pipecat-protoface"
+dynamic = ["version"]
+description = "Pipecat video avatar service for Protoface."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{ name = "Protoface Team", email = "info@protoface.com" }]
+keywords = ["pipecat", "protoface", "avatar", "video", "realtime"]
+classifiers = [
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Topic :: Multimedia :: Sound/Audio",
+  "Topic :: Multimedia :: Video",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+dependencies = [
+  "aiohttp>=3.9",
+  "Pillow>=10.4",
+  "pipecat-ai>=1.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.10.0",
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.7.0",
+  "twine>=5.0.0",
+]
+example = [
+  "pipecat-ai[google,runner,webrtc]>=1.4.0",
+  "python-dotenv>=1.0",
+]
+
+[project.urls]
+Documentation = "https://docs.protoface.com"
+Homepage = "https://protoface.com"
+Source = "https://github.com/protoface-ai/protoface-plugin-pipecat"
+Issues = "https://github.com/protoface-ai/protoface-plugin-pipecat/issues"
+
+[tool.hatch.version]
+path = "src/pipecat_protoface/version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pipecat_protoface"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src/pipecat_protoface",
+  "/examples",
+  "/tests",
+  "/CHANGELOG.md",
+  "/README.md",
+  "/LICENSE",
+  "/env.example",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = false
+warn_unused_ignores = false
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
