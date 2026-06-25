@@ -1,0 +1,46 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.egg-info/
+*.pyc
+*.pyo
+*.so
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+
+# Virtual environments
+.venv/
+.smoke-venv/
+venv/
+ENV/
+env/
+
+# Environment
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.coverage
+.mypy_cache/
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+
+# uv
+uv.lock
