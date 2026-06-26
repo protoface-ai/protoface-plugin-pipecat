@@ -121,6 +121,7 @@ class ProtofaceRelayClient:
         self._session_id: str | None = None
         self._media_ws: aiohttp.ClientWebSocketResponse | None = None
         self._media_task: asyncio.Task[None] | None = None
+        self._media_error: Exception | None = None
         self._relay: dict[str, Any] | None = None
         self._audio_queue: asyncio.Queue[ProtofaceAudioFrame | None] = asyncio.Queue()
         self._video_queue: asyncio.Queue[ProtofaceVideoFrame | None] = asyncio.Queue()
@@ -136,6 +137,7 @@ class ProtofaceRelayClient:
         max_duration_seconds: int | None = None,
         metadata: Mapping[str, str | int | float | bool | None] | None = None,
     ) -> str:
+        self._media_error = None
         payload: dict[str, Any] = {
             "avatar_id": avatar_id,
             "metadata": dict(metadata or {}),
@@ -157,11 +159,20 @@ class ProtofaceRelayClient:
         self._relay = relay
         self.input_sample_rate = int(relay.get("audio_sample_rate") or PROTOFACE_INPUT_SAMPLE_RATE)
 
-        relay_type = str(relay.get("type") or "websocket")
-        if relay_type == "websocket":
-            await self._connect_media_websocket(relay)
-            return session_id
-        raise ProtofaceException(f"Unsupported Protoface Pipecat relay type: {relay_type!r}")
+        try:
+            relay_type = str(relay.get("type") or "websocket")
+            if relay_type == "websocket":
+                await self._connect_media_websocket(relay)
+                return session_id
+            raise ProtofaceException(f"Unsupported Protoface Pipecat relay type: {relay_type!r}")
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await self.stop()
+            raise
+        except Exception:
+            with contextlib.suppress(Exception):
+                await self.stop()
+            raise
 
     async def stop(self) -> None:
         await self.flush_audio()
@@ -195,7 +206,6 @@ class ProtofaceRelayClient:
                 await media_ws.send_bytes(encode_media_record(MediaMessageType.FLUSH))
 
     async def interrupt(self) -> None:
-        await self.flush_audio()
         media_ws = self._media_ws
         if media_ws is not None:
             with contextlib.suppress(Exception):
@@ -206,6 +216,8 @@ class ProtofaceRelayClient:
         while True:
             frame = await self._audio_queue.get()
             if frame is None:
+                if self._media_error is not None:
+                    raise self._media_error
                 return
             yield frame
 
@@ -213,6 +225,8 @@ class ProtofaceRelayClient:
         while True:
             frame = await self._video_queue.get()
             if frame is None:
+                if self._media_error is not None:
+                    raise self._media_error
                 return
             yield frame
 
@@ -244,11 +258,17 @@ class ProtofaceRelayClient:
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.BINARY:
                     await self._handle_media_record(bytes(msg.data))
-                elif (
-                    msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED)
-                    or msg.type == aiohttp.WSMsgType.ERROR
-                ):
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    ws_error = ws.exception()
+                    if ws_error is not None:
+                        raise ProtofaceException(f"Protoface media socket error: {ws_error}")
+                    raise ProtofaceException("Protoface media socket error.")
+                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
                     break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._media_error = exc
         finally:
             await self._audio_queue.put(None)
             await self._video_queue.put(None)

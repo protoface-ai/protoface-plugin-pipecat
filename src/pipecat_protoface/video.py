@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -40,6 +41,7 @@ from ._client import (
 
 _BYTES_PER_SAMPLE = 2
 _DEFAULT_AUDIO_CHUNK_MS = 40
+_DEFAULT_AUDIO_SEND_AHEAD_MS = 1000
 
 
 def _debug_media(message: str) -> None:
@@ -52,6 +54,7 @@ class ProtofaceVideoSettings(ServiceSettings):
     """Runtime settings for the Protoface Pipecat video service."""
 
     audio_chunk_ms: int = _DEFAULT_AUDIO_CHUNK_MS
+    audio_send_ahead_ms: int = _DEFAULT_AUDIO_SEND_AHEAD_MS
 
 
 @dataclass(slots=True)
@@ -59,6 +62,14 @@ class _AudioChunk:
     audio: bytes
     sample_rate: int
     num_channels: int
+
+
+@dataclass(slots=True)
+class _FlushAudio:
+    pass
+
+
+_AudioQueueItem = _AudioChunk | _FlushAudio
 
 
 class ProtofaceVideoService(AIService):
@@ -100,13 +111,18 @@ class ProtofaceVideoService(AIService):
         self._audio_buffer = bytearray()
         self._audio_buffer_sample_rate = PROTOFACE_INPUT_SAMPLE_RATE
         self._audio_buffer_channels = 1
-        self._queue: asyncio.Queue[_AudioChunk] = asyncio.Queue()
+        self._queue: asyncio.Queue[_AudioQueueItem] = asyncio.Queue()
         self._connect_task: asyncio.Task[None] | None = None
         self._send_task: asyncio.Task[None] | None = None
         self._audio_task: asyncio.Task[None] | None = None
         self._video_task: asyncio.Task[None] | None = None
         self._transport_ready = False
         self._client_ready_event = asyncio.Event()
+        self._fatal_error: Exception | None = None
+        self._fatal_error_reported = False
+        self._pending_audio_frames: list[ProtofaceAudioFrame] = []
+        self._pending_video_frames: list[ProtofaceVideoFrame] = []
+        self._next_audio_send_at = 0.0
         self._should_measure_ttfb = False
         self._sent_audio_chunks = 0
         self._pushed_audio_frames = 0
@@ -122,6 +138,9 @@ class ProtofaceVideoService(AIService):
 
         await super().start(frame)
         self._client_ready_event.clear()
+        self._transport_ready = False
+        self._fatal_error = None
+        self._fatal_error_reported = False
         await self._create_send_task()
         self._connect_task = self.create_task(self._connect_client())
 
@@ -129,9 +148,11 @@ class ProtofaceVideoService(AIService):
         """Stop the hosted Protoface avatar session."""
 
         await super().stop(frame)
+        await self._flush_audio(wait_for_ready=False)
         await self._cancel_connect_task()
-        await self._flush_audio()
         await self._client.stop()
+        self._pending_audio_frames.clear()
+        self._pending_video_frames.clear()
         await self._cancel_tasks()
 
     async def cancel(self, frame: CancelFrame) -> None:
@@ -140,6 +161,8 @@ class ProtofaceVideoService(AIService):
         await super().cancel(frame)
         await self._cancel_connect_task()
         await self._client.cancel()
+        self._pending_audio_frames.clear()
+        self._pending_video_frames.clear()
         await self._cancel_tasks()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -149,6 +172,7 @@ class ProtofaceVideoService(AIService):
         if isinstance(frame, OutputTransportReadyFrame):
             self._transport_ready = True
             await self.push_frame(frame, direction)
+            await self._flush_pending_media()
         elif isinstance(frame, TTSStartedFrame):
             self._should_measure_ttfb = True
         elif isinstance(frame, BotStartedSpeakingFrame):
@@ -176,10 +200,9 @@ class ProtofaceVideoService(AIService):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._client_ready_event.clear()
-            await self.push_error_frame(
-                ErrorFrame(error=f"Protoface avatar session failed to start: {exc}", fatal=True)
-            )
+            with contextlib.suppress(Exception):
+                await self._client.cancel()
+            await self._fail_fatal("Protoface avatar session failed to start", exc)
 
     async def _create_consume_tasks(self) -> None:
         if self._audio_task is None:
@@ -230,7 +253,7 @@ class ProtofaceVideoService(AIService):
                 )
             )
 
-    async def _flush_audio(self) -> None:
+    async def _flush_audio(self, *, wait_for_ready: bool = True) -> None:
         if self._audio_buffer:
             await self._queue.put(
                 _AudioChunk(
@@ -240,10 +263,23 @@ class ProtofaceVideoService(AIService):
                 )
             )
             self._audio_buffer.clear()
-        await self._client.flush_audio()
+        if self._send_task is None:
+            await self._drain_audio_queue()
+            return
+        if self._fatal_error is not None:
+            await self._drain_audio_queue()
+            return
+        if not wait_for_ready and not self._client_ready_event.is_set():
+            await self._drain_audio_queue()
+            return
+        await self._queue.put(_FlushAudio())
+        await self._queue.join()
 
     async def _handle_interruption(self) -> None:
         self._audio_buffer.clear()
+        self._pending_audio_frames.clear()
+        self._pending_video_frames.clear()
+        self._next_audio_send_at = 0.0
         self._should_measure_ttfb = False
         await self._cancel_send_task()
         await self._drain_audio_queue()
@@ -269,48 +305,117 @@ class ProtofaceVideoService(AIService):
 
     async def _send_task_handler(self) -> None:
         await self._client_ready_event.wait()
+        if self._fatal_error is not None:
+            await self._drain_audio_queue()
+            return
         while True:
-            chunk = await self._queue.get()
+            item = await self._queue.get()
             try:
-                await self._client.send_audio(
-                    chunk.audio,
-                    sample_rate=chunk.sample_rate,
-                    num_channels=chunk.num_channels,
-                )
-                self._sent_audio_chunks += 1
-                if self._sent_audio_chunks == 1 or self._sent_audio_chunks % 100 == 0:
-                    _debug_media(
-                        "sent TTS audio chunks="
-                        f"{self._sent_audio_chunks} bytes={len(chunk.audio)} "
-                        f"sample_rate={chunk.sample_rate} channels={chunk.num_channels}"
+                if isinstance(item, _AudioChunk):
+                    await self._pace_audio_send(item)
+                    await self._client.send_audio(
+                        item.audio,
+                        sample_rate=item.sample_rate,
+                        num_channels=item.num_channels,
                     )
-                if self._should_measure_ttfb:
-                    await self.start_ttfb_metrics()
-                    self._should_measure_ttfb = False
+                    self._sent_audio_chunks += 1
+                    if self._sent_audio_chunks == 1 or self._sent_audio_chunks % 100 == 0:
+                        _debug_media(
+                            "sent TTS audio chunks="
+                            f"{self._sent_audio_chunks} bytes={len(item.audio)} "
+                            f"sample_rate={item.sample_rate} channels={item.num_channels}"
+                        )
+                    if self._should_measure_ttfb:
+                        await self.start_ttfb_metrics()
+                        self._should_measure_ttfb = False
+                else:
+                    await self._client.flush_audio()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._fail_fatal("Protoface avatar media send failed", exc)
+                await self._drain_audio_queue()
+                return
             finally:
                 self._queue.task_done()
 
+    async def _pace_audio_send(self, chunk: _AudioChunk) -> None:
+        bytes_per_second = chunk.sample_rate * chunk.num_channels * _BYTES_PER_SAMPLE
+        duration = len(chunk.audio) / bytes_per_second if bytes_per_second else 0.0
+        send_ahead = max(0, cast(ProtofaceVideoSettings, self._settings).audio_send_ahead_ms) / 1000
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if self._next_audio_send_at <= 0:
+            self._next_audio_send_at = now
+
+        lead = self._next_audio_send_at - now
+        if lead > send_ahead:
+            await asyncio.sleep(lead - send_ahead)
+            now = loop.time()
+        if self._next_audio_send_at < now:
+            self._next_audio_send_at = now
+
+        self._next_audio_send_at = max(now, self._next_audio_send_at) + duration
+
     async def _consume_audio(self) -> None:
-        async for frame in self._client.audio_frames():
-            if self._transport_ready:
-                self._pushed_audio_frames += 1
-                if self._pushed_audio_frames == 1 or self._pushed_audio_frames % 100 == 0:
-                    _debug_media(
-                        "pushed Pipecat audio frames="
-                        f"{self._pushed_audio_frames} bytes={len(frame.audio)} "
-                        f"sample_rate={frame.sample_rate} channels={frame.num_channels}"
-                    )
-                await self.push_frame(_to_pipecat_audio_frame(frame))
+        try:
+            async for frame in self._client.audio_frames():
+                if not self._transport_ready:
+                    self._pending_audio_frames.append(frame)
+                    continue
+                await self._push_audio_frame(frame)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._fail_fatal("Protoface avatar media stream failed", exc)
 
     async def _consume_video(self) -> None:
-        async for frame in self._client.video_frames():
-            if self._transport_ready:
-                self._pushed_video_frames += 1
-                if self._pushed_video_frames == 1 or self._pushed_video_frames % 100 == 0:
-                    _debug_media(
-                        f"pushed Pipecat video frames={self._pushed_video_frames} size={frame.size}"
-                    )
-                await self.push_frame(_to_pipecat_video_frame(frame))
+        try:
+            async for frame in self._client.video_frames():
+                if not self._transport_ready:
+                    self._pending_video_frames.append(frame)
+                    continue
+                await self._push_video_frame(frame)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._fail_fatal("Protoface avatar media stream failed", exc)
+
+    async def _flush_pending_media(self) -> None:
+        pending_audio = self._pending_audio_frames
+        pending_video = self._pending_video_frames
+        self._pending_audio_frames = []
+        self._pending_video_frames = []
+        for audio_frame in pending_audio:
+            await self._push_audio_frame(audio_frame)
+        for video_frame in pending_video:
+            await self._push_video_frame(video_frame)
+
+    async def _push_audio_frame(self, frame: ProtofaceAudioFrame) -> None:
+        self._pushed_audio_frames += 1
+        if self._pushed_audio_frames == 1 or self._pushed_audio_frames % 100 == 0:
+            _debug_media(
+                "pushed Pipecat audio frames="
+                f"{self._pushed_audio_frames} bytes={len(frame.audio)} "
+                f"sample_rate={frame.sample_rate} channels={frame.num_channels}"
+            )
+        await self.push_frame(_to_pipecat_audio_frame(frame))
+
+    async def _push_video_frame(self, frame: ProtofaceVideoFrame) -> None:
+        self._pushed_video_frames += 1
+        if self._pushed_video_frames == 1 or self._pushed_video_frames % 100 == 0:
+            _debug_media(
+                f"pushed Pipecat video frames={self._pushed_video_frames} size={frame.size}"
+            )
+        await self.push_frame(_to_pipecat_video_frame(frame))
+
+    async def _fail_fatal(self, message: str, exc: Exception) -> None:
+        self._fatal_error = exc
+        self._client_ready_event.set()
+        if self._fatal_error_reported:
+            return
+        self._fatal_error_reported = True
+        await self.push_error_frame(ErrorFrame(error=f"{message}: {exc}", fatal=True))
 
 
 def _to_pipecat_audio_frame(frame: ProtofaceAudioFrame) -> SpeechOutputAudioRawFrame:

@@ -9,6 +9,7 @@ import pytest
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
+    ErrorFrame,
     OutputImageRawFrame,
     OutputTransportReadyFrame,
     SpeechOutputAudioRawFrame,
@@ -18,7 +19,7 @@ from pipecat.frames.frames import (
     UserStartedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
-from pipecat_protoface import ProtofaceVideoService
+from pipecat_protoface import ProtofaceVideoService, ProtofaceVideoSettings
 from pipecat_protoface._client import (
     ProtofaceAudioFrame,
     ProtofaceMediaClient,
@@ -30,10 +31,22 @@ from pipecat_protoface.video import _to_pipecat_audio_frame, _to_pipecat_video_f
 class FakeMediaClient:
     input_sample_rate = 16_000
 
-    def __init__(self, *, start_delay: float = 0.0) -> None:
+    def __init__(
+        self,
+        *,
+        start_delay: float = 0.0,
+        start_error: Exception | None = None,
+        send_error: Exception | None = None,
+        audio_error: Exception | None = None,
+    ) -> None:
         self.start_delay = start_delay
+        self.start_error = start_error
+        self.send_error = send_error
+        self.audio_error = audio_error
         self.started: dict[str, object] | None = None
         self.sent_audio: list[tuple[bytes, int, int]] = []
+        self.sent_at: list[float] = []
+        self.events: list[str] = []
         self.flushed = 0
         self.interrupted = 0
         self.stopped = 0
@@ -50,6 +63,8 @@ class FakeMediaClient:
     ) -> str:
         if self.start_delay:
             await asyncio.sleep(self.start_delay)
+        if self.start_error is not None:
+            raise self.start_error
         self.started = {
             "avatar_id": avatar_id,
             "max_duration_seconds": max_duration_seconds,
@@ -64,9 +79,14 @@ class FakeMediaClient:
         self.canceled += 1
 
     async def send_audio(self, audio: bytes, *, sample_rate: int, num_channels: int) -> None:
+        if self.send_error is not None:
+            raise self.send_error
+        self.sent_at.append(asyncio.get_running_loop().time())
+        self.events.append("send")
         self.sent_audio.append((audio, sample_rate, num_channels))
 
     async def flush_audio(self) -> None:
+        self.events.append("flush")
         self.flushed += 1
 
     async def interrupt(self) -> None:
@@ -83,6 +103,8 @@ class FakeMediaClient:
         await self._video.put(None)
 
     async def audio_frames(self) -> AsyncIterator[ProtofaceAudioFrame]:
+        if self.audio_error is not None:
+            raise self.audio_error
         while True:
             frame = await self._audio.get()
             if frame is None:
@@ -125,6 +147,9 @@ class TestableProtofaceVideoService(ProtofaceVideoService):
         direction: FrameDirection = FrameDirection.DOWNSTREAM,
     ) -> None:
         del direction
+        self.pushed.append(frame)
+
+    async def push_error_frame(self, frame: ErrorFrame) -> None:
         self.pushed.append(frame)
 
 
@@ -234,6 +259,35 @@ async def test_service_emits_avatar_media_after_transport_ready() -> None:
 
 
 @pytest.mark.asyncio
+async def test_service_buffers_avatar_media_until_transport_ready() -> None:
+    client = FakeMediaClient()
+    service = TestableProtofaceVideoService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+    )
+
+    await service.start(StartFrame())
+    await _wait_until(lambda: client.started is not None)
+    await client.push_audio(ProtofaceAudioFrame(audio=b"\x00\x01", sample_rate=16_000))
+    await client.push_video(ProtofaceVideoFrame(image=b"rgb", size=(1, 1), pts=12))
+    await asyncio.sleep(0.05)
+
+    assert not any(isinstance(frame, SpeechOutputAudioRawFrame) for frame in service.pushed)
+    assert not any(isinstance(frame, OutputImageRawFrame) for frame in service.pushed)
+
+    await service.process_frame(OutputTransportReadyFrame(), FrameDirection.DOWNSTREAM)
+    await _wait_until(
+        lambda: (
+            any(isinstance(frame, SpeechOutputAudioRawFrame) for frame in service.pushed)
+            and any(isinstance(frame, OutputImageRawFrame) for frame in service.pushed)
+        )
+    )
+    await client.close_streams()
+    await service.cancel(CancelFrame())
+
+
+@pytest.mark.asyncio
 async def test_service_chunks_audio_and_interrupts() -> None:
     client = FakeMediaClient()
     service = TestableProtofaceVideoService(
@@ -253,6 +307,30 @@ async def test_service_chunks_audio_and_interrupts() -> None:
 
     await service.process_frame(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
     assert client.interrupted == 1
+
+    await client.close_streams()
+    await service.cancel(CancelFrame())
+
+
+@pytest.mark.asyncio
+async def test_service_paces_queued_audio_sends() -> None:
+    client = FakeMediaClient()
+    service = TestableProtofaceVideoService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+        settings=ProtofaceVideoSettings(model=None, audio_send_ahead_ms=0),
+    )
+
+    await service.start(StartFrame())
+    await service.process_frame(
+        TTSAudioRawFrame(audio=b"\x00\x00" * 1280, sample_rate=16_000, num_channels=1),
+        FrameDirection.DOWNSTREAM,
+    )
+
+    await _wait_until(lambda: len(client.sent_audio) == 2)
+
+    assert client.sent_at[1] - client.sent_at[0] >= 0.025
 
     await client.close_streams()
     await service.cancel(CancelFrame())
@@ -282,6 +360,76 @@ async def test_service_buffers_tts_until_media_client_is_ready() -> None:
 
 
 @pytest.mark.asyncio
+async def test_service_start_failure_unblocks_send_task() -> None:
+    client = FakeMediaClient(start_error=RuntimeError("start failed"))
+    service = TestableProtofaceVideoService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+    )
+
+    await service.start(StartFrame())
+    await service.process_frame(
+        TTSAudioRawFrame(audio=b"\x00\x00" * 640, sample_rate=16_000, num_channels=1),
+        FrameDirection.DOWNSTREAM,
+    )
+    await _wait_until(lambda: any(isinstance(frame, ErrorFrame) for frame in service.pushed))
+    await asyncio.wait_for(
+        service.process_frame(TTSStoppedFrame(), FrameDirection.DOWNSTREAM),
+        timeout=1.0,
+    )
+
+    assert client.sent_audio == []
+    assert client.canceled == 1
+
+    await service.cancel(CancelFrame())
+
+
+@pytest.mark.asyncio
+async def test_service_send_errors_push_fatal_error() -> None:
+    client = FakeMediaClient(send_error=RuntimeError("send failed"))
+    service = TestableProtofaceVideoService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+    )
+
+    await service.start(StartFrame())
+    await service.process_frame(
+        TTSAudioRawFrame(audio=b"\x00\x00" * 640, sample_rate=16_000, num_channels=1),
+        FrameDirection.DOWNSTREAM,
+    )
+
+    await _wait_until(lambda: any(isinstance(frame, ErrorFrame) for frame in service.pushed))
+    error = next(frame for frame in service.pushed if isinstance(frame, ErrorFrame))
+    assert error.fatal is True
+    assert "send failed" in error.error
+
+    await client.close_streams()
+    await service.cancel(CancelFrame())
+
+
+@pytest.mark.asyncio
+async def test_service_media_errors_push_fatal_error() -> None:
+    client = FakeMediaClient(audio_error=RuntimeError("media failed"))
+    service = TestableProtofaceVideoService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+    )
+
+    await service.start(StartFrame())
+
+    await _wait_until(lambda: any(isinstance(frame, ErrorFrame) for frame in service.pushed))
+    error = next(frame for frame in service.pushed if isinstance(frame, ErrorFrame))
+    assert error.fatal is True
+    assert "media failed" in error.error
+
+    await client.close_streams()
+    await service.cancel(CancelFrame())
+
+
+@pytest.mark.asyncio
 async def test_service_flushes_leftover_audio_with_original_channels() -> None:
     client = FakeMediaClient()
     service = TestableProtofaceVideoService(
@@ -301,6 +449,7 @@ async def test_service_flushes_leftover_audio_with_original_channels() -> None:
     await _wait_until(lambda: bool(client.sent_audio))
 
     assert client.sent_audio == [(b"\x00\x00" * 160 * 2, 16_000, 2)]
+    assert client.events == ["send", "flush"]
 
     await client.close_streams()
     await service.cancel(CancelFrame())
