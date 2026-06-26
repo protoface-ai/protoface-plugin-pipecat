@@ -26,6 +26,7 @@ PROTOFACE_INPUT_SAMPLE_RATE = 16_000
 _USER_AGENT = f"pipecat-protoface/{__version__}"
 _DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 _MAX_PENDING_KIND_FRAMES = 64
+_MAX_PENDING_MEDIA_FRAMES = 64
 
 
 class ProtofaceException(Exception):
@@ -145,7 +146,9 @@ class ProtofaceRelayClient:
         self._video_queue: asyncio.Queue[ProtofaceVideoFrame | None] = asyncio.Queue(
             maxsize=_MAX_PENDING_KIND_FRAMES
         )
-        self._media_queue: asyncio.Queue[ProtofaceMediaFrame | None] = asyncio.Queue()
+        self._media_queue: asyncio.Queue[ProtofaceMediaFrame | None] = asyncio.Queue(
+            maxsize=_MAX_PENDING_MEDIA_FRAMES
+        )
         self._media_sequence = 0
 
     @property
@@ -168,7 +171,7 @@ class ProtofaceRelayClient:
         self._media_error = None
         self._audio_queue = asyncio.Queue(maxsize=_MAX_PENDING_KIND_FRAMES)
         self._video_queue = asyncio.Queue(maxsize=_MAX_PENDING_KIND_FRAMES)
-        self._media_queue = asyncio.Queue()
+        self._media_queue = asyncio.Queue(maxsize=_MAX_PENDING_MEDIA_FRAMES)
         self._media_sequence = 0
         payload: dict[str, Any] = {
             "avatar_id": avatar_id,
@@ -321,7 +324,7 @@ class ProtofaceRelayClient:
         finally:
             self._put_bounded(self._audio_queue, None)
             self._put_bounded(self._video_queue, None)
-            await self._media_queue.put(None)
+            self._put_bounded(self._media_queue, None)
 
     async def _handle_media_record(self, data: bytes) -> None:
         record = decode_media_record(data)
