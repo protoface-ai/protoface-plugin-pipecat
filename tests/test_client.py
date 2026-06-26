@@ -163,6 +163,23 @@ async def test_direct_relay_client_rolls_back_session_when_media_connect_fails()
 
 
 @pytest.mark.asyncio
+async def test_direct_relay_client_second_start_stops_existing_session() -> None:
+    session = _FakeWebSocketSession()
+    client = _TestDirectRelayClient(session)
+
+    await client.start(avatar_id="av_demo")
+    await client.start(avatar_id="av_demo")
+
+    assert [request["path"] for request in client.requests] == [
+        "/v1/pipecat/sessions",
+        "/v1/sessions/sess_test/end",
+        "/v1/pipecat/sessions",
+    ]
+
+    await client.stop()
+
+
+@pytest.mark.asyncio
 async def test_direct_relay_client_consumes_audio_and_video_records() -> None:
     session = _FakeWebSocketSession()
     client = _TestDirectRelayClient(session)

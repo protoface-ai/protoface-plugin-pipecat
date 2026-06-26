@@ -137,7 +137,15 @@ class ProtofaceRelayClient:
         max_duration_seconds: int | None = None,
         metadata: Mapping[str, str | int | float | bool | None] | None = None,
     ) -> str:
+        if (
+            self._session_id is not None
+            or self._media_ws is not None
+            or self._media_task is not None
+        ):
+            await self.stop()
         self._media_error = None
+        self._audio_queue = asyncio.Queue()
+        self._video_queue = asyncio.Queue()
         payload: dict[str, Any] = {
             "avatar_id": avatar_id,
             "metadata": dict(metadata or {}),
@@ -182,7 +190,7 @@ class ProtofaceRelayClient:
         await self._close_media_websocket()
         if self._owns_session and self._session is not None:
             await self._session.close()
-        self._session = None
+            self._session = None
         self._session_id = None
 
     async def cancel(self) -> None:

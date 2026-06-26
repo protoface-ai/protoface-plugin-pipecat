@@ -70,6 +70,7 @@ class _FlushAudio:
 
 
 _AudioQueueItem = _AudioChunk | _FlushAudio
+_PendingMediaFrame = ProtofaceAudioFrame | ProtofaceVideoFrame
 
 
 class ProtofaceVideoService(AIService):
@@ -120,8 +121,7 @@ class ProtofaceVideoService(AIService):
         self._client_ready_event = asyncio.Event()
         self._fatal_error: Exception | None = None
         self._fatal_error_reported = False
-        self._pending_audio_frames: list[ProtofaceAudioFrame] = []
-        self._pending_video_frames: list[ProtofaceVideoFrame] = []
+        self._pending_media_frames: list[_PendingMediaFrame] = []
         self._next_audio_send_at = 0.0
         self._should_measure_ttfb = False
         self._sent_audio_chunks = 0
@@ -136,6 +136,8 @@ class ProtofaceVideoService(AIService):
     async def start(self, frame: StartFrame) -> None:
         """Start the hosted Protoface avatar session."""
 
+        if self._has_runtime_state():
+            await self._teardown_runtime(cancel_client=True)
         await super().start(frame)
         self._client_ready_event.clear()
         self._transport_ready = False
@@ -151,19 +153,41 @@ class ProtofaceVideoService(AIService):
         await self._flush_audio(wait_for_ready=False)
         await self._cancel_connect_task()
         await self._client.stop()
-        self._pending_audio_frames.clear()
-        self._pending_video_frames.clear()
-        await self._cancel_tasks()
+        await self._teardown_runtime(cancel_client=False)
 
     async def cancel(self, frame: CancelFrame) -> None:
         """Cancel the hosted Protoface avatar session."""
 
         await super().cancel(frame)
+        await self._teardown_runtime(cancel_client=True)
+
+    def _has_runtime_state(self) -> bool:
+        return (
+            self._connect_task is not None
+            or self._send_task is not None
+            or self._audio_task is not None
+            or self._video_task is not None
+            or self._client_ready_event.is_set()
+            or self._transport_ready
+            or bool(self._audio_buffer)
+            or not self._queue.empty()
+            or bool(self._pending_media_frames)
+        )
+
+    async def _teardown_runtime(self, *, cancel_client: bool) -> None:
         await self._cancel_connect_task()
-        await self._client.cancel()
-        self._pending_audio_frames.clear()
-        self._pending_video_frames.clear()
         await self._cancel_tasks()
+        if cancel_client:
+            await self._client.cancel()
+        self._audio_buffer.clear()
+        await self._drain_audio_queue()
+        self._pending_media_frames.clear()
+        self._client_ready_event.clear()
+        self._transport_ready = False
+        self._fatal_error = None
+        self._fatal_error_reported = False
+        self._next_audio_send_at = 0.0
+        self._should_measure_ttfb = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         """Process Pipecat frames through the Protoface avatar service."""
@@ -205,22 +229,30 @@ class ProtofaceVideoService(AIService):
             await self._fail_fatal("Protoface avatar session failed to start", exc)
 
     async def _create_consume_tasks(self) -> None:
-        if self._audio_task is None:
+        if self._audio_task is None or self._audio_task.done():
             self._audio_task = self.create_task(self._consume_audio())
-        if self._video_task is None:
+        if self._video_task is None or self._video_task.done():
             self._video_task = self.create_task(self._consume_video())
 
     async def _cancel_tasks(self) -> None:
         for attr in ("_send_task", "_audio_task", "_video_task"):
-            task = getattr(self, attr)
-            if task is not None:
-                await self.cancel_task(task)
-                setattr(self, attr, None)
+            await self._cancel_task_attr(attr)
 
     async def _cancel_connect_task(self) -> None:
-        if self._connect_task is not None:
-            await self.cancel_task(self._connect_task)
-            self._connect_task = None
+        await self._cancel_task_attr("_connect_task")
+
+    async def _cancel_task_attr(self, attr: str) -> None:
+        task = getattr(self, attr)
+        if task is None:
+            return
+        if task.done():
+            try:
+                task.result()
+            except (asyncio.CancelledError, Exception):
+                pass
+        else:
+            await self.cancel_task(task)
+        setattr(self, attr, None)
 
     async def _handle_audio_frame(self, frame: TTSAudioRawFrame) -> None:
         target_sample_rate = self._client.input_sample_rate or PROTOFACE_INPUT_SAMPLE_RATE
@@ -277,8 +309,7 @@ class ProtofaceVideoService(AIService):
 
     async def _handle_interruption(self) -> None:
         self._audio_buffer.clear()
-        self._pending_audio_frames.clear()
-        self._pending_video_frames.clear()
+        self._pending_media_frames.clear()
         self._next_audio_send_at = 0.0
         self._should_measure_ttfb = False
         await self._cancel_send_task()
@@ -287,7 +318,7 @@ class ProtofaceVideoService(AIService):
         await self._create_send_task()
 
     async def _create_send_task(self) -> None:
-        if self._send_task is None:
+        if self._send_task is None or self._send_task.done():
             self._send_task = self.create_task(self._send_task_handler())
 
     async def _cancel_send_task(self) -> None:
@@ -361,7 +392,7 @@ class ProtofaceVideoService(AIService):
         try:
             async for frame in self._client.audio_frames():
                 if not self._transport_ready:
-                    self._pending_audio_frames.append(frame)
+                    self._pending_media_frames.append(frame)
                     continue
                 await self._push_audio_frame(frame)
         except asyncio.CancelledError:
@@ -373,7 +404,7 @@ class ProtofaceVideoService(AIService):
         try:
             async for frame in self._client.video_frames():
                 if not self._transport_ready:
-                    self._pending_video_frames.append(frame)
+                    self._pending_media_frames.append(frame)
                     continue
                 await self._push_video_frame(frame)
         except asyncio.CancelledError:
@@ -382,14 +413,13 @@ class ProtofaceVideoService(AIService):
             await self._fail_fatal("Protoface avatar media stream failed", exc)
 
     async def _flush_pending_media(self) -> None:
-        pending_audio = self._pending_audio_frames
-        pending_video = self._pending_video_frames
-        self._pending_audio_frames = []
-        self._pending_video_frames = []
-        for audio_frame in pending_audio:
-            await self._push_audio_frame(audio_frame)
-        for video_frame in pending_video:
-            await self._push_video_frame(video_frame)
+        pending = self._pending_media_frames
+        self._pending_media_frames = []
+        for frame in pending:
+            if isinstance(frame, ProtofaceAudioFrame):
+                await self._push_audio_frame(frame)
+            else:
+                await self._push_video_frame(frame)
 
     async def _push_audio_frame(self, frame: ProtofaceAudioFrame) -> None:
         self._pushed_audio_frames += 1
