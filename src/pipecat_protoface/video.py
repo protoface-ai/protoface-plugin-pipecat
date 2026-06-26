@@ -46,6 +46,7 @@ _BYTES_PER_SAMPLE = 2
 _DEFAULT_AUDIO_CHUNK_MS = 40
 _DEFAULT_AUDIO_SEND_AHEAD_MS = 1000
 _DEFAULT_CLIENT_READY_TIMEOUT_SECS = 30.0
+_STOP_CLIENT_READY_GRACE_SECS = 0.25
 _MAX_PENDING_AUDIO_BYTES = 8 * 1024 * 1024
 _MAX_PENDING_AUDIO_EVENTS = 256
 _MAX_PENDING_MEDIA_FRAMES = 64
@@ -170,7 +171,18 @@ class ProtofaceVideoService(AIService):
         """Stop the hosted Protoface avatar session."""
 
         await super().stop(frame)
-        await self._flush_audio(report_ready_timeout=False)
+        if (
+            not self._client_ready_event.is_set()
+            and self._connect_task is not None
+            and not self._connect_task.done()
+        ):
+            timeout = min(
+                cast(ProtofaceVideoSettings, self._settings).client_ready_timeout_secs,
+                _STOP_CLIENT_READY_GRACE_SECS,
+            )
+            await self._wait_for_client_ready(timeout_secs=timeout)
+        if self._client_ready_event.is_set():
+            await self._flush_audio(report_ready_timeout=False)
         await self._cancel_connect_task()
         await self._cancel_task_attr("_media_task")
         await self._client.stop()
@@ -365,8 +377,15 @@ class ProtofaceVideoService(AIService):
         if wait_for_queue:
             await self._queue.join()
 
-    async def _wait_for_client_ready(self) -> bool:
-        timeout = max(0.0, cast(ProtofaceVideoSettings, self._settings).client_ready_timeout_secs)
+    async def _wait_for_client_ready(self, *, timeout_secs: float | None = None) -> bool:
+        timeout = max(
+            0.0,
+            (
+                cast(ProtofaceVideoSettings, self._settings).client_ready_timeout_secs
+                if timeout_secs is None
+                else timeout_secs
+            ),
+        )
         if timeout <= 0:
             return self._client_ready_event.is_set()
         try:

@@ -703,7 +703,6 @@ async def test_service_stop_does_not_hang_waiting_for_client_ready() -> None:
         api_key="sk_test",
         avatar_id="av_demo",
         media_client=client,
-        settings=ProtofaceVideoSettings(client_ready_timeout_secs=0.01),
     )
 
     await service.start(StartFrame())
