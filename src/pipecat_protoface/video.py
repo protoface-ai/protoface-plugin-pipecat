@@ -35,6 +35,7 @@ from pipecat.services.settings import ServiceSettings
 from ._client import (
     PROTOFACE_INPUT_SAMPLE_RATE,
     ProtofaceAudioFrame,
+    ProtofaceException,
     ProtofaceMediaClient,
     ProtofaceMediaFrame,
     ProtofaceRelayClient,
@@ -506,6 +507,11 @@ class ProtofaceVideoService(AIService):
                         continue
                     generation = self._media_generation
                 await self._push_media_frame(frame, generation=generation)
+            if self._fatal_error is None:
+                await self._fail_fatal(
+                    "Protoface avatar media stream ended",
+                    ProtofaceException("Protoface media stream ended unexpectedly."),
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:

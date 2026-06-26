@@ -278,7 +278,6 @@ async def test_service_starts_and_stops_media_client() -> None:
         "metadata": {"customer_session_id": "abc"},
     }
 
-    await client.close_streams()
     await service.stop(EndFrame())
     assert client.flushed == 1
     assert client.stopped == 1
@@ -882,6 +881,29 @@ async def test_service_media_errors_push_fatal_error() -> None:
     assert client.sent_audio == []
 
     await client.close_streams()
+    await service.cancel(CancelFrame())
+
+
+@pytest.mark.asyncio
+async def test_service_media_stream_end_pushes_fatal_error() -> None:
+    client = FakeMediaClient()
+    service = TestableProtofaceVideoService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+    )
+
+    await service.start(StartFrame())
+    await _wait_until(lambda: client.started is not None)
+
+    await client.close_streams()
+    await _wait_until(lambda: any(isinstance(frame, ErrorFrame) for frame in service.pushed))
+
+    error = next(frame for frame in service.pushed if isinstance(frame, ErrorFrame))
+    assert error.fatal is True
+    assert "media stream ended" in error.error
+    assert client.canceled == 1
+
     await service.cancel(CancelFrame())
 
 
