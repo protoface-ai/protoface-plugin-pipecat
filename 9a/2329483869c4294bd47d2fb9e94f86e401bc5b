@@ -1,0 +1,32 @@
+src/pipecat_protoface/_client.py
+  s_e57d4c66278a66::t_5e7d85328b1700 27,392-394
+tests/test_video.py
+  s_e57d4c66278a66::t_bc2537cb77723b 950,963-1003
+  s_e57d4c66278a66::t_4e0e2bfa4ba618 1004-1005
+src/pipecat_protoface/video.py
+  s_e57d4c66278a66::t_1d94df39fe6111 48,63,172,182-183,333-338,347-352,359-368,408-410,424-425,427-428
+tests/test_client.py
+  s_e57d4c66278a66::t_6beb5b987ce752 13,140-147
+  s_e57d4c66278a66::t_206d8e2392d366 148-149
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "9a2329483869c4294bd47d2fb9e94f86e401bc5b",
+  "prompts": {},
+  "humans": {
+    "h_de56eb73e6f761": {
+      "author": "Protoface Team <295041388+protoface-team@users.noreply.github.com>"
+    }
+  },
+  "sessions": {
+    "s_e57d4c66278a66": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ee77f-f025-7120-879c-a005c5058345",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Protoface Team <295041388+protoface-team@users.noreply.github.com>"
+    }
+  }
+}
