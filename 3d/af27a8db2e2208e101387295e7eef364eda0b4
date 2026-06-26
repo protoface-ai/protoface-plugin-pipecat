@@ -1,0 +1,76 @@
+examples/video_service.py
+  s_e57d4c66278a66::t_a5c8badb80200a 57-200,204-206
+  s_e57d4c66278a66::t_9dee607320170a 54-56
+  s_e57d4c66278a66::t_a7f478d8730ab4 201-203
+  s_e57d4c66278a66::t_a06ea833b47e50 207-209
+  s_e57d4c66278a66::t_b8199f587281f9 1-53,210-213
+README.md
+  s_e57d4c66278a66::t_80e4f4570a5382 7
+  s_e57d4c66278a66::t_dc3e8e464fb530 120-121
+  s_e57d4c66278a66::t_801d38d8b34782 5,22-91
+  s_e57d4c66278a66::t_50bea0c03440a8 2-4
+  s_e57d4c66278a66::t_adc177032e8817 6
+  s_e57d4c66278a66::t_df339c1b3626e3 8-10,19-21
+  s_e57d4c66278a66::t_43cc8d007ab9ff 92-94,117-119
+  s_e57d4c66278a66::t_56985e478a40d1 122-124
+  s_e57d4c66278a66::t_3c22834230eb2c 1,11-18,95-116,125-138
+env.example
+  s_e57d4c66278a66::t_dc3e8e464fb530 10-11
+  s_e57d4c66278a66::t_c50939b207d832 7-9
+  s_e57d4c66278a66::t_914f4827dc0869 1-6
+CHANGELOG.md
+  s_e57d4c66278a66::t_dc3e8e464fb530 17
+  s_e57d4c66278a66::t_9f4cafc5165fb6 12
+  s_42b11baf48ffdc::t_01d43c36e013c1 1-11,13-16
+.github/workflows/ci.yml
+  s_e57d4c66278a66::t_04cf7adf674143 1-44
+.github/workflows/release.yml
+  s_e57d4c66278a66::t_82977781812cf5 1-70
+pyproject.toml
+  s_e57d4c66278a66::t_284affdc2914aa 1-81
+src/pipecat_protoface/__init__.py
+  s_e57d4c66278a66::t_54abcf93f12532 1-10
+src/pipecat_protoface/_client.py
+  s_e57d4c66278a66::t_a522b23304c168 1-364
+src/pipecat_protoface/_media.py
+  s_e57d4c66278a66::t_5903d540654d9d 1-119
+src/pipecat_protoface/py.typed
+  s_e57d4c66278a66::t_4e548321225cb7 1
+src/pipecat_protoface/version.py
+  s_e57d4c66278a66::t_2595e630dbd820 1-3
+src/pipecat_protoface/video.py
+  s_e57d4c66278a66::t_1ad7fb950874ac 1-340
+tests/test_client.py
+  s_e57d4c66278a66::t_e7d42c4454cb43 1-182
+tests/test_video.py
+  s_e57d4c66278a66::t_7a2ac076783604 1-306
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "3daf27a8db2e2208e101387295e7eef364eda0b4",
+  "prompts": {},
+  "humans": {
+    "h_de56eb73e6f761": {
+      "author": "Protoface Team <295041388+protoface-team@users.noreply.github.com>"
+    }
+  },
+  "sessions": {
+    "s_42b11baf48ffdc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f04fd-fa5b-7160-b87f-47962fbc93fa",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Protoface Team <295041388+protoface-team@users.noreply.github.com>"
+    },
+    "s_e57d4c66278a66": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ee77f-f025-7120-879c-a005c5058345",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Protoface Team <295041388+protoface-team@users.noreply.github.com>"
+    }
+  }
+}
