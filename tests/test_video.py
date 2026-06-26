@@ -26,7 +26,11 @@ from pipecat_protoface._client import (
     ProtofaceMediaFrame,
     ProtofaceVideoFrame,
 )
-from pipecat_protoface.video import _to_pipecat_audio_frame, _to_pipecat_video_frame
+from pipecat_protoface.video import (
+    _MAX_PENDING_MEDIA_FRAMES,
+    _to_pipecat_audio_frame,
+    _to_pipecat_video_frame,
+)
 
 
 class FakeMediaClient:
@@ -56,6 +60,8 @@ class FakeMediaClient:
         self.interrupted = 0
         self.stopped = 0
         self.canceled = 0
+        self.media_reads_enabled = asyncio.Event()
+        self.media_reads_enabled.set()
         self._audio: asyncio.Queue[ProtofaceAudioFrame | None] = asyncio.Queue()
         self._video: asyncio.Queue[ProtofaceVideoFrame | None] = asyncio.Queue()
         self._media: asyncio.Queue[ProtofaceMediaFrame | None] = asyncio.Queue()
@@ -104,6 +110,11 @@ class FakeMediaClient:
     async def interrupt(self) -> None:
         self.interrupted += 1
 
+    def clear_pending_media(self) -> None:
+        self._drain_queue(self._audio)
+        self._drain_queue(self._video)
+        self._drain_queue(self._media)
+
     async def push_audio(self, frame: ProtofaceAudioFrame) -> None:
         await self._audio.put(frame)
         await self._media.put(frame)
@@ -137,10 +148,24 @@ class FakeMediaClient:
         if self.audio_error is not None:
             raise self.audio_error
         while True:
+            await self.media_reads_enabled.wait()
             frame = await self._media.get()
             if frame is None:
                 return
             yield frame
+
+    @staticmethod
+    def _drain_queue(queue: asyncio.Queue[Any]) -> None:
+        saw_terminal = False
+        while True:
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if item is None:
+                saw_terminal = True
+        if saw_terminal:
+            queue.put_nowait(None)
 
 
 class TestableProtofaceVideoService(ProtofaceVideoService):
@@ -345,6 +370,44 @@ async def test_service_replays_buffered_avatar_media_in_received_order() -> None
 
 
 @pytest.mark.asyncio
+async def test_service_caps_buffered_avatar_media_until_transport_ready() -> None:
+    client = FakeMediaClient()
+    service = TestableProtofaceVideoService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+    )
+
+    await service.start(StartFrame())
+    await _wait_until(lambda: client.started is not None)
+    for index in range(_MAX_PENDING_MEDIA_FRAMES + 10):
+        await client.push_video(ProtofaceVideoFrame(image=b"rgb", size=(1, 1), pts=index))
+
+    def pending_video_pts() -> list[int | None]:
+        return [
+            frame.pts
+            for frame in service._pending_media_frames
+            if isinstance(frame, ProtofaceVideoFrame)
+        ]
+
+    await _wait_until(
+        lambda: (
+            len(pending_video_pts()) == _MAX_PENDING_MEDIA_FRAMES
+            and pending_video_pts()[-1] == _MAX_PENDING_MEDIA_FRAMES + 9
+        )
+    )
+
+    await service.process_frame(OutputTransportReadyFrame(), FrameDirection.DOWNSTREAM)
+    video_frames = [frame for frame in service.pushed if isinstance(frame, OutputImageRawFrame)]
+    assert len(video_frames) == _MAX_PENDING_MEDIA_FRAMES
+    assert video_frames[0].pts == 10
+    assert video_frames[-1].pts == _MAX_PENDING_MEDIA_FRAMES + 9
+
+    await client.close_streams()
+    await service.cancel(CancelFrame())
+
+
+@pytest.mark.asyncio
 async def test_service_chunks_audio_and_interrupts() -> None:
     client = FakeMediaClient()
     service = TestableProtofaceVideoService(
@@ -364,6 +427,34 @@ async def test_service_chunks_audio_and_interrupts() -> None:
 
     await service.process_frame(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
     assert client.interrupted == 1
+
+    await client.close_streams()
+    await service.cancel(CancelFrame())
+
+
+@pytest.mark.asyncio
+async def test_service_drops_queued_avatar_media_on_interruption() -> None:
+    client = FakeMediaClient()
+    client.media_reads_enabled.clear()
+    service = TestableProtofaceVideoService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+    )
+
+    await service.start(StartFrame())
+    await service.process_frame(OutputTransportReadyFrame(), FrameDirection.DOWNSTREAM)
+    await _wait_until(lambda: client.started is not None)
+    await client.push_audio(ProtofaceAudioFrame(audio=b"stale", sample_rate=16_000))
+    await client.push_video(ProtofaceVideoFrame(image=b"stale", size=(1, 1), pts=1))
+
+    await service.process_frame(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    client.media_reads_enabled.set()
+    await asyncio.sleep(0.05)
+
+    assert client.interrupted == 1
+    assert not any(isinstance(frame, SpeechOutputAudioRawFrame) for frame in service.pushed)
+    assert not any(isinstance(frame, OutputImageRawFrame) for frame in service.pushed)
 
     await client.close_streams()
     await service.cancel(CancelFrame())
@@ -608,6 +699,7 @@ async def test_service_flushes_leftover_audio_with_original_channels() -> None:
 
     assert client.sent_audio == [(b"\x00\x00" * 160 * 2, 16_000, 2)]
     assert client.events == ["send", "flush"]
+    assert any(isinstance(frame, TTSStoppedFrame) for frame in service.pushed)
 
     await client.close_streams()
     await service.cancel(CancelFrame())

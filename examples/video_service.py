@@ -110,14 +110,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
                 params=VADParams(
                     confidence=_env_float("PIPECAT_VAD_CONFIDENCE", 0.7),
                     start_secs=_env_float("PIPECAT_VAD_START_SECS", 0.2),
-                    stop_secs=_env_float("PIPECAT_VAD_STOP_SECS", 0.6),
+                    stop_secs=_env_float("PIPECAT_VAD_STOP_SECS", 0.2),
                     min_volume=_env_float("PIPECAT_VAD_MIN_VOLUME", 0.2),
                 ),
             ),
             user_turn_strategies=UserTurnStrategies(
                 stop=[
                     SpeechTimeoutUserTurnStopStrategy(
-                        user_speech_timeout=_env_float("PIPECAT_USER_SPEECH_TIMEOUT", 0.6),
+                        user_speech_timeout=_env_float("PIPECAT_USER_SPEECH_TIMEOUT", 0.2),
                         wait_for_transcript=False,
                     )
                 ]

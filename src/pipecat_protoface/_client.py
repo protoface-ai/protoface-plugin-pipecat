@@ -90,6 +90,10 @@ class ProtofaceMediaClient(Protocol):
         """Clear queued avatar speech after a user interruption."""
         ...
 
+    def clear_pending_media(self) -> None:
+        """Discard avatar media already queued locally."""
+        ...
+
     def audio_frames(self) -> AsyncIterator[ProtofaceAudioFrame]:
         """Yield avatar speech audio frames."""
         ...
@@ -233,6 +237,11 @@ class ProtofaceRelayClient:
                 await media_ws.send_bytes(encode_media_record(MediaMessageType.INTERRUPT))
             return
 
+    def clear_pending_media(self) -> None:
+        self._drain_queue(self._audio_queue)
+        self._drain_queue(self._video_queue)
+        self._drain_queue(self._media_queue)
+
     async def _audio_frame_iterator(self) -> AsyncIterator[ProtofaceAudioFrame]:
         while True:
             frame = await self._audio_queue.get()
@@ -337,6 +346,19 @@ class ProtofaceRelayClient:
         sequence_number = self._media_sequence
         self._media_sequence += 1
         return sequence_number
+
+    @staticmethod
+    def _drain_queue(queue: asyncio.Queue[Any]) -> None:
+        saw_terminal = False
+        while True:
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if item is None:
+                saw_terminal = True
+        if saw_terminal:
+            queue.put_nowait(None)
 
     async def _close_media_websocket(self) -> None:
         task = self._media_task

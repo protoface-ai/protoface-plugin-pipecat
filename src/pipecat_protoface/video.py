@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, cast
@@ -43,6 +44,7 @@ from ._client import (
 _BYTES_PER_SAMPLE = 2
 _DEFAULT_AUDIO_CHUNK_MS = 40
 _DEFAULT_AUDIO_SEND_AHEAD_MS = 1000
+_MAX_PENDING_MEDIA_FRAMES = 64
 
 
 def _debug_media(message: str) -> None:
@@ -123,7 +125,9 @@ class ProtofaceVideoService(AIService):
         self._fatal_error: Exception | None = None
         self._fatal_error_reported = False
         self._pending_audio_events: list[_PendingAudioEvent] = []
-        self._pending_media_frames: list[_PendingMediaFrame] = []
+        self._pending_media_frames: deque[_PendingMediaFrame] = deque(
+            maxlen=_MAX_PENDING_MEDIA_FRAMES
+        )
         self._next_audio_send_at = 0.0
         self._should_measure_ttfb = False
         self._sent_audio_chunks = 0
@@ -209,6 +213,7 @@ class ProtofaceVideoService(AIService):
             await self._handle_audio_frame(frame)
         elif isinstance(frame, TTSStoppedFrame):
             await self._flush_audio()
+            await self.push_frame(frame, direction)
         elif isinstance(frame, InterruptionFrame | UserStartedSpeakingFrame):
             await self._handle_interruption()
             await self.push_frame(frame, direction)
@@ -327,6 +332,7 @@ class ProtofaceVideoService(AIService):
         await self._cancel_send_task()
         await self._drain_audio_queue()
         await self._client.interrupt()
+        self._client.clear_pending_media()
         await self._create_send_task()
 
     async def _process_pending_audio_events(self) -> None:
@@ -422,8 +428,8 @@ class ProtofaceVideoService(AIService):
             await self._fail_fatal("Protoface avatar media stream failed", exc)
 
     async def _flush_pending_media(self) -> None:
-        pending = self._pending_media_frames
-        self._pending_media_frames = []
+        pending = list(self._pending_media_frames)
+        self._pending_media_frames.clear()
         for frame in pending:
             await self._push_media_frame(frame)
 
