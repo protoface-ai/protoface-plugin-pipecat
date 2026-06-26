@@ -128,7 +128,10 @@ class ProtofaceVideoService(AIService):
         self._pending_media_frames: deque[_PendingMediaFrame] = deque(
             maxlen=_MAX_PENDING_MEDIA_FRAMES
         )
-        self._media_delivery_lock = asyncio.Lock()
+        self._audio_state_lock = asyncio.Lock()
+        self._media_state_lock = asyncio.Lock()
+        self._flushing_pending_media = False
+        self._media_generation = 0
         self._next_audio_send_at = 0.0
         self._should_measure_ttfb = False
         self._ttfb_metrics_active = False
@@ -151,6 +154,8 @@ class ProtofaceVideoService(AIService):
         self._transport_ready = False
         self._fatal_error = None
         self._fatal_error_reported = False
+        self._flushing_pending_media = False
+        self._media_generation += 1
         self._should_measure_ttfb = False
         self._ttfb_metrics_active = False
         await self._create_send_task()
@@ -197,6 +202,8 @@ class ProtofaceVideoService(AIService):
         self._transport_ready = False
         self._fatal_error = None
         self._fatal_error_reported = False
+        self._flushing_pending_media = False
+        self._media_generation += 1
         self._next_audio_send_at = 0.0
         self._should_measure_ttfb = False
         self._ttfb_metrics_active = False
@@ -207,9 +214,11 @@ class ProtofaceVideoService(AIService):
         await super().process_frame(frame, direction)
         if isinstance(frame, OutputTransportReadyFrame):
             await self.push_frame(frame, direction)
-            async with self._media_delivery_lock:
-                await self._flush_pending_media()
+            async with self._media_state_lock:
                 self._transport_ready = True
+                generation = self._media_generation
+                self._flushing_pending_media = bool(self._pending_media_frames)
+            await self._flush_pending_media(generation)
         elif isinstance(frame, TTSStartedFrame):
             self._should_measure_ttfb = True
             await self.push_frame(frame, direction)
@@ -234,13 +243,10 @@ class ProtofaceVideoService(AIService):
                 metadata=self._metadata,
             )
             await self._create_consume_tasks()
-            self._client_ready_event.set()
             await self._process_pending_audio_events()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            with contextlib.suppress(Exception):
-                await self._client.cancel()
             await self._fail_fatal("Protoface avatar session failed to start", exc)
 
     async def _create_consume_tasks(self) -> None:
@@ -268,20 +274,24 @@ class ProtofaceVideoService(AIService):
         setattr(self, attr, None)
 
     async def _handle_audio_frame(self, frame: TTSAudioRawFrame) -> None:
-        if self._fatal_error is not None:
-            return
-        if not self._client_ready_event.is_set():
-            self._pending_audio_events.append(frame)
-            return
-        await self._enqueue_audio_frame(frame)
+        async with self._audio_state_lock:
+            if self._fatal_error is not None:
+                return
+            if not self._client_ready_event.is_set():
+                self._pending_audio_events.append(frame)
+                return
+            await self._enqueue_audio_frame_locked(frame)
 
-    async def _enqueue_audio_frame(self, frame: TTSAudioRawFrame) -> None:
+    async def _enqueue_audio_frame_locked(self, frame: TTSAudioRawFrame) -> None:
         target_sample_rate = self._client.input_sample_rate or PROTOFACE_INPUT_SAMPLE_RATE
         if self._audio_buffer and (
             target_sample_rate != self._audio_buffer_sample_rate
             or frame.num_channels != self._audio_buffer_channels
         ):
-            await self._flush_audio()
+            await self._flush_audio_locked(
+                wait_for_ready=False,
+                wait_for_queue=self._client_ready_event.is_set(),
+            )
         self._audio_buffer_sample_rate = target_sample_rate
         self._audio_buffer_channels = frame.num_channels
 
@@ -307,6 +317,15 @@ class ProtofaceVideoService(AIService):
             )
 
     async def _flush_audio(self, *, wait_for_ready: bool = True) -> None:
+        async with self._audio_state_lock:
+            await self._flush_audio_locked(wait_for_ready=wait_for_ready)
+
+    async def _flush_audio_locked(
+        self,
+        *,
+        wait_for_ready: bool = True,
+        wait_for_queue: bool = True,
+    ) -> None:
         if self._fatal_error is not None:
             self._audio_buffer.clear()
             await self._drain_audio_queue()
@@ -326,36 +345,47 @@ class ProtofaceVideoService(AIService):
         if self._send_task is None:
             await self._drain_audio_queue()
             return
-        if not wait_for_ready and not self._client_ready_event.is_set():
+        if not wait_for_ready and not self._client_ready_event.is_set() and wait_for_queue:
             await self._drain_audio_queue()
             return
         await self._queue.put(_FlushAudio())
-        await self._queue.join()
+        if wait_for_queue:
+            await self._queue.join()
 
     async def _handle_interruption(self) -> None:
-        self._audio_buffer.clear()
-        self._pending_audio_events.clear()
-        self._pending_media_frames.clear()
-        self._next_audio_send_at = 0.0
-        self._should_measure_ttfb = False
-        self._ttfb_metrics_active = False
-        await self._cancel_send_task()
-        await self._drain_audio_queue()
+        async with self._audio_state_lock:
+            self._audio_buffer.clear()
+            self._pending_audio_events.clear()
+            self._next_audio_send_at = 0.0
+            self._should_measure_ttfb = False
+            self._ttfb_metrics_active = False
+            await self._cancel_send_task()
+            await self._drain_audio_queue()
+        async with self._media_state_lock:
+            self._media_generation += 1
+            self._flushing_pending_media = False
+            self._pending_media_frames.clear()
         await self._client.interrupt()
         self._client.clear_pending_media()
         await self._create_send_task()
 
     async def _process_pending_audio_events(self) -> None:
-        pending = self._pending_audio_events
-        self._pending_audio_events = []
-        for event in pending:
-            if self._fatal_error is not None:
-                await self._drain_audio_queue()
-                return
-            if isinstance(event, TTSAudioRawFrame):
-                await self._enqueue_audio_frame(event)
-            else:
-                await self._flush_audio()
+        async with self._audio_state_lock:
+            while self._pending_audio_events:
+                pending = self._pending_audio_events
+                self._pending_audio_events = []
+                for event in pending:
+                    if self._fatal_error is not None:
+                        await self._drain_audio_queue()
+                        return
+                    if isinstance(event, TTSAudioRawFrame):
+                        await self._enqueue_audio_frame_locked(event)
+                    else:
+                        await self._flush_audio_locked(
+                            wait_for_ready=False,
+                            wait_for_queue=False,
+                        )
+            self._client_ready_event.set()
 
     async def _create_send_task(self) -> None:
         if self._send_task is None or self._send_task.done():
@@ -435,33 +465,57 @@ class ProtofaceVideoService(AIService):
     async def _consume_media(self) -> None:
         try:
             async for frame in self._client.media_frames():
-                async with self._media_delivery_lock:
+                async with self._media_state_lock:
                     if self._fatal_error is not None:
                         self._client.clear_pending_media()
                         return
-                    if not self._transport_ready:
+                    if (
+                        not self._transport_ready
+                        or self._flushing_pending_media
+                        or self._pending_media_frames
+                    ):
                         self._pending_media_frames.append(frame)
                         continue
-                    await self._push_media_frame(frame)
+                    generation = self._media_generation
+                await self._push_media_frame(frame, generation=generation)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             await self._fail_fatal("Protoface avatar media stream failed", exc)
 
-    async def _flush_pending_media(self) -> None:
-        pending = list(self._pending_media_frames)
-        self._pending_media_frames.clear()
-        for frame in pending:
-            await self._push_media_frame(frame)
+    async def _flush_pending_media(self, generation: int) -> None:
+        while True:
+            async with self._media_state_lock:
+                if self._fatal_error is not None or generation != self._media_generation:
+                    if generation == self._media_generation:
+                        self._flushing_pending_media = False
+                    return
+                if not self._pending_media_frames:
+                    self._flushing_pending_media = False
+                    return
+                frame = self._pending_media_frames.popleft()
+            await self._push_media_frame(frame, generation=generation)
 
-    async def _push_media_frame(self, frame: ProtofaceMediaFrame) -> None:
-        if self._fatal_error is not None:
+    async def _push_media_frame(
+        self,
+        frame: ProtofaceMediaFrame,
+        *,
+        generation: int | None = None,
+    ) -> None:
+        if self._should_drop_media(generation):
             return
         await self._stop_ttfb_metrics_if_active()
+        if self._should_drop_media(generation):
+            return
         if isinstance(frame, ProtofaceAudioFrame):
             await self._push_audio_frame(frame)
         else:
             await self._push_video_frame(frame)
+
+    def _should_drop_media(self, generation: int | None) -> bool:
+        return self._fatal_error is not None or (
+            generation is not None and generation != self._media_generation
+        )
 
     async def _stop_ttfb_metrics_if_active(self) -> None:
         if not self._ttfb_metrics_active:
@@ -489,13 +543,19 @@ class ProtofaceVideoService(AIService):
 
     async def _fail_fatal(self, message: str, exc: Exception) -> None:
         self._fatal_error = exc
-        self._audio_buffer.clear()
-        self._pending_audio_events.clear()
-        self._pending_media_frames.clear()
-        self._should_measure_ttfb = False
-        self._ttfb_metrics_active = False
-        await self._drain_audio_queue()
+        async with self._audio_state_lock:
+            self._audio_buffer.clear()
+            self._pending_audio_events.clear()
+            self._should_measure_ttfb = False
+            self._ttfb_metrics_active = False
+            await self._drain_audio_queue()
+        async with self._media_state_lock:
+            self._media_generation += 1
+            self._flushing_pending_media = False
+            self._pending_media_frames.clear()
         self._client.clear_pending_media()
+        with contextlib.suppress(Exception):
+            await self._client.cancel()
         self._client_ready_event.set()
         if self._fatal_error_reported:
             return

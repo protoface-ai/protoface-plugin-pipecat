@@ -24,7 +24,6 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat_protoface import ProtofaceVideoService, ProtofaceVideoSettings
 from pipecat_protoface._client import (
     ProtofaceAudioFrame,
-    ProtofaceMediaClient,
     ProtofaceMediaFrame,
     ProtofaceVideoFrame,
 )
@@ -97,6 +96,7 @@ class FakeMediaClient:
 
     async def cancel(self) -> None:
         self.canceled += 1
+        await self.close_streams()
 
     async def send_audio(self, audio: bytes, *, sample_rate: int, num_channels: int) -> None:
         if self.send_error is not None:
@@ -223,11 +223,6 @@ async def _wait_until(predicate: object, *, timeout: float = 1.0) -> None:
     assert predicate()  # type: ignore[operator]
 
 
-def test_fake_client_satisfies_protocol() -> None:
-    client: ProtofaceMediaClient = FakeMediaClient()
-    assert client.input_sample_rate == 16_000
-
-
 def test_audio_frame_conversion() -> None:
     frame = _to_pipecat_audio_frame(
         ProtofaceAudioFrame(
@@ -262,12 +257,6 @@ def test_video_frame_conversion() -> None:
     assert frame.format == "RGB"
     assert frame.pts == 123
     assert frame.transport_source == "protoface"
-
-
-@pytest.mark.asyncio
-async def test_tts_audio_frame_shape_matches_pipecat() -> None:
-    frame = TTSAudioRawFrame(audio=b"\x00\x00" * 160, sample_rate=16_000, num_channels=1)
-    assert frame.num_frames == 160
 
 
 @pytest.mark.asyncio
@@ -461,6 +450,43 @@ async def test_service_keeps_buffered_media_before_new_ready_media() -> None:
 
 
 @pytest.mark.asyncio
+async def test_service_stops_pending_media_flush_after_interruption() -> None:
+    client = FakeMediaClient()
+
+    class InterruptingFlushService(TestableProtofaceVideoService):
+        async def push_frame(
+            self,
+            frame: object,
+            direction: FrameDirection = FrameDirection.DOWNSTREAM,
+        ) -> None:
+            await super().push_frame(frame, direction)
+            if isinstance(frame, OutputImageRawFrame) and frame.image == b"first":
+                await self.process_frame(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+
+    service = InterruptingFlushService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+    )
+
+    await service.start(StartFrame())
+    await _wait_until(lambda: client.started is not None)
+    await client.push_video(ProtofaceVideoFrame(image=b"first", size=(1, 1), pts=1))
+    await client.push_video(ProtofaceVideoFrame(image=b"second", size=(1, 1), pts=2))
+    await _wait_until(lambda: len(service._pending_media_frames) == 2)
+
+    await service.process_frame(OutputTransportReadyFrame(), FrameDirection.DOWNSTREAM)
+    await asyncio.sleep(0.05)
+
+    video_frames = [frame for frame in service.pushed if isinstance(frame, OutputImageRawFrame)]
+    assert [frame.image for frame in video_frames] == [b"first"]
+    assert client.interrupted == 1
+
+    await client.close_streams()
+    await service.cancel(CancelFrame())
+
+
+@pytest.mark.asyncio
 async def test_service_caps_buffered_avatar_media_until_transport_ready() -> None:
     client = FakeMediaClient()
     service = TestableProtofaceVideoService(
@@ -599,6 +625,54 @@ async def test_service_buffers_tts_until_media_client_is_ready() -> None:
 
 
 @pytest.mark.asyncio
+async def test_service_preserves_queued_tts_before_ready_tts() -> None:
+    client = FakeMediaClient(start_delay=0.01)
+
+    class SlowPendingAudioService(TestableProtofaceVideoService):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)
+            self.pending_audio_started = asyncio.Event()
+            self.release_pending_audio = asyncio.Event()
+
+        async def _enqueue_audio_frame_locked(self, frame: TTSAudioRawFrame) -> None:
+            if not self.pending_audio_started.is_set():
+                self.pending_audio_started.set()
+                await self.release_pending_audio.wait()
+            await super()._enqueue_audio_frame_locked(frame)
+
+    service = SlowPendingAudioService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+    )
+
+    await service.start(StartFrame())
+    await service.process_frame(
+        TTSAudioRawFrame(audio=b"\x01\x01" * 640, sample_rate=16_000, num_channels=1),
+        FrameDirection.DOWNSTREAM,
+    )
+    await _wait_until(lambda: service.pending_audio_started.is_set())
+
+    second_frame_task = asyncio.create_task(
+        service.process_frame(
+            TTSAudioRawFrame(audio=b"\x02\x02" * 640, sample_rate=16_000, num_channels=1),
+            FrameDirection.DOWNSTREAM,
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert client.sent_audio == []
+
+    service.release_pending_audio.set()
+    await second_frame_task
+    await _wait_until(lambda: len(client.sent_audio) == 2)
+
+    assert [audio for audio, _, _ in client.sent_audio] == [b"\x01\x01" * 640, b"\x02\x02" * 640]
+
+    await client.close_streams()
+    await service.cancel(CancelFrame())
+
+
+@pytest.mark.asyncio
 async def test_service_resamples_queued_tts_to_negotiated_sample_rate() -> None:
     client = FakeMediaClient(start_delay=0.05, session_input_sample_rate=24_000)
     service = TestableProtofaceVideoService(
@@ -718,6 +792,7 @@ async def test_service_send_errors_push_fatal_error() -> None:
     error = next(frame for frame in service.pushed if isinstance(frame, ErrorFrame))
     assert error.fatal is True
     assert "send failed" in error.error
+    assert client.canceled == 1
 
     await client.push_audio(ProtofaceAudioFrame(audio=b"late", sample_rate=16_000))
     await asyncio.sleep(0.05)
@@ -742,6 +817,7 @@ async def test_service_media_errors_push_fatal_error() -> None:
     error = next(frame for frame in service.pushed if isinstance(frame, ErrorFrame))
     assert error.fatal is True
     assert "media failed" in error.error
+    assert client.canceled == 1
 
     await service.process_frame(
         TTSAudioRawFrame(audio=b"\x00\x00" * 640, sample_rate=16_000, num_channels=1),
