@@ -585,7 +585,15 @@ class ProtofaceVideoService(AIService):
 
     async def _consume_media(self) -> None:
         try:
-            async for frame in self._client.media_frames():
+            media_frames = self._client.media_frames().__aiter__()
+            while True:
+                async with self._media_state_lock:
+                    dequeue_generation = self._media_generation
+                try:
+                    frame = await anext(media_frames)
+                except StopAsyncIteration:
+                    break
+
                 buffered = False
                 flush_generation: int | None = None
                 overflow: ProtofaceException | None = None
@@ -594,6 +602,8 @@ class ProtofaceVideoService(AIService):
                     if self._fatal_error is not None:
                         self._client.clear_pending_media()
                         return
+                    if dequeue_generation != self._media_generation:
+                        continue
                     if not self._transport_ready or self._flushing_pending_media:
                         overflow = self._append_pending_media_frame_locked(frame)
                         buffered = True
@@ -601,9 +611,9 @@ class ProtofaceVideoService(AIService):
                         overflow = self._append_pending_media_frame_locked(frame)
                         if overflow is None:
                             self._flushing_pending_media = True
-                            flush_generation = self._media_generation
+                            flush_generation = dequeue_generation
                     else:
-                        generation = self._media_generation
+                        generation = dequeue_generation
                 if overflow is not None:
                     await self._fail_fatal("Protoface avatar media buffer overflow", overflow)
                     return
