@@ -387,13 +387,13 @@ class ProtofaceRelayClient:
         self._media_task = None
         ws = self._media_ws
         self._media_ws = None
-        if ws is not None:
-            with contextlib.suppress(Exception):
-                await ws.close()
         if task is not None:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        if ws is not None:
+            with contextlib.suppress(Exception):
+                await ws.close()
 
     def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None:
