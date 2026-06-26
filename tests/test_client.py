@@ -10,6 +10,7 @@ from pipecat_protoface._client import (
     ProtofaceException,
     ProtofaceRelayClient,
     ProtofaceVideoFrame,
+    _MAX_PENDING_KIND_FRAMES,
     _read_payload,
 )
 from pipecat_protoface._media import (
@@ -255,6 +256,34 @@ async def test_direct_relay_client_consumes_audio_and_video_records() -> None:
     assert isinstance(second_media, ProtofaceVideoFrame)
     assert first_media.sequence_number == 0
     assert second_media.sequence_number == 1
+
+    await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_direct_relay_client_bounds_unused_kind_queues() -> None:
+    session = _FakeWebSocketSession()
+    client = _TestDirectRelayClient(session)
+
+    await client.start(avatar_id="av_demo")
+    frame_count = _MAX_PENDING_KIND_FRAMES + 5
+    for index in range(frame_count):
+        await session.ws.messages.put(
+            _FakeWSMessage(
+                media_audio_record(
+                    f"out-{index}".encode(),
+                    sample_rate=16000,
+                    num_channels=1,
+                )
+            )
+        )
+
+    media_iter = client.media_frames()
+    for _ in range(frame_count):
+        assert isinstance(await media_iter.__anext__(), ProtofaceAudioFrame)
+
+    assert client._audio_queue.qsize() == _MAX_PENDING_KIND_FRAMES
+    assert client._video_queue.qsize() == 0
 
     await client.stop()
 

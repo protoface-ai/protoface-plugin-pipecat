@@ -24,6 +24,7 @@ from pipecat_protoface.version import __version__
 DEFAULT_API_URL = "https://api.protoface.com"
 PROTOFACE_INPUT_SAMPLE_RATE = 16_000
 _USER_AGENT = f"pipecat-protoface/{__version__}"
+_MAX_PENDING_KIND_FRAMES = 64
 
 
 class ProtofaceException(Exception):
@@ -137,8 +138,12 @@ class ProtofaceRelayClient:
         self._media_task: asyncio.Task[None] | None = None
         self._media_error: Exception | None = None
         self._relay: dict[str, Any] | None = None
-        self._audio_queue: asyncio.Queue[ProtofaceAudioFrame | None] = asyncio.Queue()
-        self._video_queue: asyncio.Queue[ProtofaceVideoFrame | None] = asyncio.Queue()
+        self._audio_queue: asyncio.Queue[ProtofaceAudioFrame | None] = asyncio.Queue(
+            maxsize=_MAX_PENDING_KIND_FRAMES
+        )
+        self._video_queue: asyncio.Queue[ProtofaceVideoFrame | None] = asyncio.Queue(
+            maxsize=_MAX_PENDING_KIND_FRAMES
+        )
         self._media_queue: asyncio.Queue[ProtofaceMediaFrame | None] = asyncio.Queue()
         self._media_sequence = 0
 
@@ -160,8 +165,8 @@ class ProtofaceRelayClient:
         ):
             await self.stop()
         self._media_error = None
-        self._audio_queue = asyncio.Queue()
-        self._video_queue = asyncio.Queue()
+        self._audio_queue = asyncio.Queue(maxsize=_MAX_PENDING_KIND_FRAMES)
+        self._video_queue = asyncio.Queue(maxsize=_MAX_PENDING_KIND_FRAMES)
         self._media_queue = asyncio.Queue()
         self._media_sequence = 0
         payload: dict[str, Any] = {
@@ -313,8 +318,8 @@ class ProtofaceRelayClient:
         except Exception as exc:
             self._media_error = exc
         finally:
-            await self._audio_queue.put(None)
-            await self._video_queue.put(None)
+            self._put_bounded(self._audio_queue, None)
+            self._put_bounded(self._video_queue, None)
             await self._media_queue.put(None)
 
     async def _handle_media_record(self, data: bytes) -> None:
@@ -327,7 +332,7 @@ class ProtofaceRelayClient:
                 transport_source="protoface-direct",
                 sequence_number=self._next_media_sequence(),
             )
-            await self._audio_queue.put(audio_frame)
+            self._put_bounded(self._audio_queue, audio_frame)
             await self._media_queue.put(audio_frame)
             return
         if record.msg_type is MediaMessageType.VIDEO:
@@ -336,7 +341,7 @@ class ProtofaceRelayClient:
                 record.blob,
                 sequence_number=self._next_media_sequence(),
             )
-            await self._video_queue.put(video_frame)
+            self._put_bounded(self._video_queue, video_frame)
             await self._media_queue.put(video_frame)
             return
         if record.msg_type is MediaMessageType.ERROR:
@@ -360,6 +365,13 @@ class ProtofaceRelayClient:
                 saw_terminal = True
         if saw_terminal:
             queue.put_nowait(None)
+
+    @staticmethod
+    def _put_bounded(queue: asyncio.Queue[Any], item: Any) -> None:
+        if queue.full():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
+        queue.put_nowait(item)
 
     async def _close_media_websocket(self) -> None:
         task = self._media_task
