@@ -1,0 +1,25 @@
+src/pipecat_protoface/_client.py
+  s_e57d4c66278a66::t_488ca0d473b9f5 29,149-151,174
+  s_e57d4c66278a66::t_e3f02c307ac3b0 327
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "2a0dcd9d9b061edf39ea476e9f60e7b40b043863",
+  "prompts": {},
+  "humans": {
+    "h_de56eb73e6f761": {
+      "author": "Protoface Team <295041388+protoface-team@users.noreply.github.com>"
+    }
+  },
+  "sessions": {
+    "s_e57d4c66278a66": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ee77f-f025-7120-879c-a005c5058345",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Protoface Team <295041388+protoface-team@users.noreply.github.com>"
+    }
+  }
+}
