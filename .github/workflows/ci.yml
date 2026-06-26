@@ -1,0 +1,42 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  lint-test-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --extra dev --extra example
+
+      - name: Run ruff
+        run: uv run ruff check .
+
+      - name: Run ruff format check
+        run: uv run ruff format --check .
+
+      - name: Run mypy
+        run: uv run python -m mypy src tests examples
+
+      - name: Run tests
+        run: uv run python -m pytest
+
+      - name: Build package
+        run: uv build
+
+      - name: Check package
+        run: uv run python -m twine check dist/*

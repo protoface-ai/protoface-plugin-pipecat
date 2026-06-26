@@ -1,0 +1,316 @@
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+import aiohttp
+import pytest
+from pipecat_protoface._client import (
+    ProtofaceAudioFrame,
+    ProtofaceException,
+    ProtofaceRelayClient,
+    ProtofaceVideoFrame,
+    _DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    _MAX_PENDING_KIND_FRAMES,
+    _read_payload,
+)
+from pipecat_protoface._media import (
+    MediaMessageType,
+    decode_media_record,
+    encode_media_record,
+    media_audio_record,
+    media_video_record,
+)
+from pipecat_protoface.version import __version__
+
+
+class _FakeWSMessage:
+    def __init__(self, data: bytes) -> None:
+        self.type = aiohttp.WSMsgType.BINARY
+        self.data = data
+
+
+class _FakeWebSocket:
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+        self.closed = False
+        self.messages: asyncio.Queue[_FakeWSMessage | None] = asyncio.Queue()
+
+    async def send_bytes(self, data: bytes) -> None:
+        self.sent.append(data)
+
+    async def close(self) -> None:
+        self.closed = True
+        await self.messages.put(None)
+
+    def __aiter__(self) -> _FakeWebSocket:
+        return self
+
+    async def __anext__(self) -> _FakeWSMessage:
+        item = await self.messages.get()
+        if item is None:
+            raise StopAsyncIteration
+        return item
+
+
+class _FakeWebSocketSession:
+    def __init__(self, *, connect_error: Exception | None = None) -> None:
+        self.connect_error = connect_error
+        self.ws = _FakeWebSocket()
+        self.ws_connects: list[dict[str, Any]] = []
+        self.closed = False
+
+    async def ws_connect(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str],
+        protocols: tuple[str, ...],
+    ) -> _FakeWebSocket:
+        self.ws_connects.append({"url": url, "headers": headers, "protocols": protocols})
+        if self.connect_error is not None:
+            raise self.connect_error
+        return self.ws
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _TextOnlyResponse:
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self.text_calls = 0
+        self.json_calls = 0
+
+    async def text(self) -> str:
+        self.text_calls += 1
+        return self._text
+
+    async def json(self, *, content_type: str | None = None) -> object:
+        del content_type
+        self.json_calls += 1
+        raise AssertionError("response.json() should not be called")
+
+
+class _TestDirectRelayClient(ProtofaceRelayClient):
+    def __init__(self, session: _FakeWebSocketSession) -> None:
+        super().__init__(
+            api_key="sk_test",
+            session=session,  # type: ignore[arg-type]
+        )
+        self.requests: list[dict[str, Any]] = []
+
+    async def _json(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.requests.append({"method": method, "path": path, "json": json})
+        if path == "/v1/pipecat/sessions":
+            return {
+                "session": {"id": "sess_test"},
+                "relay": {
+                    "type": "websocket",
+                    "protocol": "protoface.pipecat.media.v1",
+                    "media_url": "ws://api.test/v1/pipecat/sessions/sess_test/media",
+                    "media_token": "pfm_client",
+                    "audio_sample_rate": 16000,
+                    "video_encoding": "rgb24",
+                    "decoded_video_format": "RGB",
+                    "supports_audio_output": True,
+                },
+            }
+        if path == "/v1/sessions/sess_test/end":
+            return {}
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+
+def test_relay_client_uses_protoface_api_url_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PROTOFACE_API_URL", "https://api.test.protoface.com/")
+
+    client = ProtofaceRelayClient(api_key="sk_test")
+
+    assert client._api_url == "https://api.test.protoface.com"
+
+
+@pytest.mark.asyncio
+async def test_relay_client_owned_session_has_default_timeout() -> None:
+    client = ProtofaceRelayClient(api_key="sk_test")
+    session = client._ensure_session()
+
+    assert session.timeout.total == _DEFAULT_REQUEST_TIMEOUT_SECONDS
+
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_read_payload_parses_response_text_once() -> None:
+    response = _TextOnlyResponse('{"session":{"id":"sess_test"}}')
+
+    payload = await _read_payload(response)  # type: ignore[arg-type]
+
+    assert payload == {"session": {"id": "sess_test"}}
+    assert response.text_calls == 1
+    assert response.json_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_direct_relay_client_sends_audio_control_records() -> None:
+    session = _FakeWebSocketSession()
+    client = _TestDirectRelayClient(session)
+
+    await client.start(avatar_id="av_demo")
+
+    assert client.requests[0]["json"]["relay_mode"] == "websocket"
+    assert session.ws_connects == [
+        {
+            "url": "ws://api.test/v1/pipecat/sessions/sess_test/media",
+            "headers": {
+                "Authorization": "Bearer pfm_client",
+                "User-Agent": f"pipecat-protoface/{__version__}",
+            },
+            "protocols": ("protoface.pipecat.media.v1", "pfm_client"),
+        }
+    ]
+
+    await client.send_audio(b"pcm", sample_rate=16000, num_channels=1)
+    await client.flush_audio()
+    await client.interrupt()
+
+    audio = decode_media_record(session.ws.sent[0])
+    assert audio.msg_type is MediaMessageType.AUDIO
+    assert audio.header == {"sample_rate": 16000, "num_channels": 1}
+    assert audio.blob == b"pcm"
+    assert decode_media_record(session.ws.sent[1]).msg_type is MediaMessageType.FLUSH
+    assert decode_media_record(session.ws.sent[2]).msg_type is MediaMessageType.INTERRUPT
+
+    await client.stop()
+    assert session.ws.closed
+
+
+@pytest.mark.asyncio
+async def test_direct_relay_client_rolls_back_session_when_media_connect_fails() -> None:
+    session = _FakeWebSocketSession(connect_error=RuntimeError("connect failed"))
+    client = _TestDirectRelayClient(session)
+
+    with pytest.raises(RuntimeError, match="connect failed"):
+        await client.start(avatar_id="av_demo")
+
+    assert client.session_id is None
+    assert [request["path"] for request in client.requests] == [
+        "/v1/pipecat/sessions",
+        "/v1/sessions/sess_test/end",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_direct_relay_client_second_start_stops_existing_session() -> None:
+    session = _FakeWebSocketSession()
+    client = _TestDirectRelayClient(session)
+
+    await client.start(avatar_id="av_demo")
+    await client.start(avatar_id="av_demo")
+
+    assert [request["path"] for request in client.requests] == [
+        "/v1/pipecat/sessions",
+        "/v1/sessions/sess_test/end",
+        "/v1/pipecat/sessions",
+    ]
+
+    await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_direct_relay_client_consumes_audio_and_video_records() -> None:
+    session = _FakeWebSocketSession()
+    client = _TestDirectRelayClient(session)
+
+    await client.start(avatar_id="av_demo")
+    await session.ws.messages.put(
+        _FakeWSMessage(media_audio_record(b"out", sample_rate=16000, num_channels=1))
+    )
+    await session.ws.messages.put(
+        _FakeWSMessage(
+            media_video_record(
+                b"\x00\x01\x02\x03\x04\x05",
+                width=1,
+                height=2,
+                encoding="rgb24",
+                frame_index=1,
+                timestamp_ms=123,
+            )
+        )
+    )
+
+    audio_iter = client.audio_frames()
+    video_iter = client.video_frames()
+    media_iter = client.media_frames()
+    audio = await audio_iter.__anext__()
+    video = await video_iter.__anext__()
+    first_media = await media_iter.__anext__()
+    second_media = await media_iter.__anext__()
+
+    assert audio.audio == b"out"
+    assert audio.sample_rate == 16000
+    assert audio.transport_source == "protoface-direct"
+    assert audio.sequence_number == 0
+    assert video.image == b"\x00\x01\x02\x03\x04\x05"
+    assert video.size == (1, 2)
+    assert video.pts == 123
+    assert video.transport_source == "protoface-direct"
+    assert video.sequence_number == 1
+    assert isinstance(first_media, ProtofaceAudioFrame)
+    assert isinstance(second_media, ProtofaceVideoFrame)
+    assert first_media.sequence_number == 0
+    assert second_media.sequence_number == 1
+
+    await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_direct_relay_client_bounds_unused_kind_queues() -> None:
+    session = _FakeWebSocketSession()
+    client = _TestDirectRelayClient(session)
+
+    await client.start(avatar_id="av_demo")
+    frame_count = _MAX_PENDING_KIND_FRAMES + 5
+    for index in range(frame_count):
+        await session.ws.messages.put(
+            _FakeWSMessage(
+                media_audio_record(
+                    f"out-{index}".encode(),
+                    sample_rate=16000,
+                    num_channels=1,
+                )
+            )
+        )
+
+    media_iter = client.media_frames()
+    for _ in range(frame_count):
+        assert isinstance(await media_iter.__anext__(), ProtofaceAudioFrame)
+
+    assert client._audio_queue.qsize() == _MAX_PENDING_KIND_FRAMES
+    assert client._video_queue.qsize() == 0
+
+    await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_direct_relay_client_propagates_media_errors() -> None:
+    session = _FakeWebSocketSession()
+    client = _TestDirectRelayClient(session)
+
+    await client.start(avatar_id="av_demo")
+    await session.ws.messages.put(
+        _FakeWSMessage(encode_media_record(MediaMessageType.ERROR, {"message": "avatar failed"}))
+    )
+
+    audio_iter = client.audio_frames()
+    with pytest.raises(ProtofaceException, match="avatar failed"):
+        await audio_iter.__anext__()
+
+    await client.stop()
