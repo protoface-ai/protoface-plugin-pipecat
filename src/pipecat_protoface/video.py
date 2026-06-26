@@ -548,17 +548,19 @@ class ProtofaceVideoService(AIService):
             await self._fail_fatal("Protoface avatar media stream failed", exc)
 
     async def _flush_pending_media(self, generation: int) -> None:
-        while True:
+        try:
+            while True:
+                async with self._media_state_lock:
+                    if self._fatal_error is not None or generation != self._media_generation:
+                        return
+                    if not self._pending_media_frames:
+                        return
+                    frame = self._pending_media_frames.popleft()
+                await self._push_media_frame(frame, generation=generation)
+        finally:
             async with self._media_state_lock:
-                if self._fatal_error is not None or generation != self._media_generation:
-                    if generation == self._media_generation:
-                        self._flushing_pending_media = False
-                    return
-                if not self._pending_media_frames:
+                if generation == self._media_generation:
                     self._flushing_pending_media = False
-                    return
-                frame = self._pending_media_frames.popleft()
-            await self._push_media_frame(frame, generation=generation)
 
     async def _push_media_frame(
         self,
