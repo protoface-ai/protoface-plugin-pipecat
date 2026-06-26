@@ -524,18 +524,23 @@ class ProtofaceVideoService(AIService):
     async def _consume_media(self) -> None:
         try:
             async for frame in self._client.media_frames():
+                flush_generation: int | None = None
                 async with self._media_state_lock:
                     if self._fatal_error is not None:
                         self._client.clear_pending_media()
                         return
-                    if (
-                        not self._transport_ready
-                        or self._flushing_pending_media
-                        or self._pending_media_frames
-                    ):
+                    if not self._transport_ready or self._flushing_pending_media:
                         self._pending_media_frames.append(frame)
                         continue
-                    generation = self._media_generation
+                    if self._pending_media_frames:
+                        self._pending_media_frames.append(frame)
+                        self._flushing_pending_media = True
+                        flush_generation = self._media_generation
+                    else:
+                        generation = self._media_generation
+                if flush_generation is not None:
+                    await self._flush_pending_media(flush_generation)
+                    continue
                 await self._push_media_frame(frame, generation=generation)
             if self._fatal_error is None:
                 await self._fail_fatal(
@@ -556,7 +561,13 @@ class ProtofaceVideoService(AIService):
                     if not self._pending_media_frames:
                         return
                     frame = self._pending_media_frames.popleft()
-                await self._push_media_frame(frame, generation=generation)
+                try:
+                    await self._push_media_frame(frame, generation=generation)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    await self._fail_fatal("Protoface avatar media delivery failed", exc)
+                    return
         finally:
             async with self._media_state_lock:
                 if generation == self._media_generation:
