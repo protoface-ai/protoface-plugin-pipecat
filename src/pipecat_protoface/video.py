@@ -128,6 +128,7 @@ class ProtofaceVideoService(AIService):
         self._pending_media_frames: deque[_PendingMediaFrame] = deque(
             maxlen=_MAX_PENDING_MEDIA_FRAMES
         )
+        self._media_delivery_lock = asyncio.Lock()
         self._next_audio_send_at = 0.0
         self._should_measure_ttfb = False
         self._ttfb_metrics_active = False
@@ -205,9 +206,10 @@ class ProtofaceVideoService(AIService):
 
         await super().process_frame(frame, direction)
         if isinstance(frame, OutputTransportReadyFrame):
-            self._transport_ready = True
             await self.push_frame(frame, direction)
-            await self._flush_pending_media()
+            async with self._media_delivery_lock:
+                await self._flush_pending_media()
+                self._transport_ready = True
         elif isinstance(frame, TTSStartedFrame):
             self._should_measure_ttfb = True
             await self.push_frame(frame, direction)
@@ -433,13 +435,14 @@ class ProtofaceVideoService(AIService):
     async def _consume_media(self) -> None:
         try:
             async for frame in self._client.media_frames():
-                if self._fatal_error is not None:
-                    self._client.clear_pending_media()
-                    return
-                if not self._transport_ready:
-                    self._pending_media_frames.append(frame)
-                    continue
-                await self._push_media_frame(frame)
+                async with self._media_delivery_lock:
+                    if self._fatal_error is not None:
+                        self._client.clear_pending_media()
+                        return
+                    if not self._transport_ready:
+                        self._pending_media_frames.append(frame)
+                        continue
+                    await self._push_media_frame(frame)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

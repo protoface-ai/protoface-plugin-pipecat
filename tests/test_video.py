@@ -412,6 +412,55 @@ async def test_service_replays_buffered_avatar_media_in_received_order() -> None
 
 
 @pytest.mark.asyncio
+async def test_service_keeps_buffered_media_before_new_ready_media() -> None:
+    client = FakeMediaClient()
+
+    class OrderingProbeService(TestableProtofaceVideoService):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)
+            self.injected_new_media = False
+
+        async def push_frame(
+            self,
+            frame: object,
+            direction: FrameDirection = FrameDirection.DOWNSTREAM,
+        ) -> None:
+            if (
+                isinstance(frame, OutputImageRawFrame)
+                and frame.image == b"old"
+                and not self.injected_new_media
+            ):
+                self.injected_new_media = True
+                await client.push_video(ProtofaceVideoFrame(image=b"new", size=(1, 1), pts=2))
+                await asyncio.sleep(0.05)
+            await super().push_frame(frame, direction)
+
+    service = OrderingProbeService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+    )
+
+    await service.start(StartFrame())
+    await _wait_until(lambda: client.started is not None)
+    await client.push_video(ProtofaceVideoFrame(image=b"old", size=(1, 1), pts=1))
+    await _wait_until(lambda: len(service._pending_media_frames) == 1)
+
+    await service.process_frame(OutputTransportReadyFrame(), FrameDirection.DOWNSTREAM)
+    await _wait_until(
+        lambda: (
+            len([frame for frame in service.pushed if isinstance(frame, OutputImageRawFrame)]) == 2
+        )
+    )
+
+    video_frames = [frame for frame in service.pushed if isinstance(frame, OutputImageRawFrame)]
+    assert [frame.image for frame in video_frames] == [b"old", b"new"]
+
+    await client.close_streams()
+    await service.cancel(CancelFrame())
+
+
+@pytest.mark.asyncio
 async def test_service_caps_buffered_avatar_media_until_transport_ready() -> None:
     client = FakeMediaClient()
     service = TestableProtofaceVideoService(
