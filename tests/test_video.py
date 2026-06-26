@@ -23,6 +23,7 @@ from pipecat_protoface import ProtofaceVideoService, ProtofaceVideoSettings
 from pipecat_protoface._client import (
     ProtofaceAudioFrame,
     ProtofaceMediaClient,
+    ProtofaceMediaFrame,
     ProtofaceVideoFrame,
 )
 from pipecat_protoface.video import _to_pipecat_audio_frame, _to_pipecat_video_frame
@@ -38,11 +39,14 @@ class FakeMediaClient:
         start_error: Exception | None = None,
         send_error: Exception | None = None,
         audio_error: Exception | None = None,
+        session_input_sample_rate: int | None = None,
     ) -> None:
+        self.input_sample_rate = 16_000
         self.start_delay = start_delay
         self.start_error = start_error
         self.send_error = send_error
         self.audio_error = audio_error
+        self.session_input_sample_rate = session_input_sample_rate
         self.started: dict[str, object] | None = None
         self.sent_audio: list[tuple[bytes, int, int]] = []
         self.sent_at: list[float] = []
@@ -54,6 +58,7 @@ class FakeMediaClient:
         self.canceled = 0
         self._audio: asyncio.Queue[ProtofaceAudioFrame | None] = asyncio.Queue()
         self._video: asyncio.Queue[ProtofaceVideoFrame | None] = asyncio.Queue()
+        self._media: asyncio.Queue[ProtofaceMediaFrame | None] = asyncio.Queue()
 
     async def start(
         self,
@@ -67,8 +72,11 @@ class FakeMediaClient:
         if self.start_error is not None:
             raise self.start_error
         self.starts += 1
+        if self.session_input_sample_rate is not None:
+            self.input_sample_rate = self.session_input_sample_rate
         self._audio = asyncio.Queue()
         self._video = asyncio.Queue()
+        self._media = asyncio.Queue()
         self.started = {
             "avatar_id": avatar_id,
             "max_duration_seconds": max_duration_seconds,
@@ -98,13 +106,16 @@ class FakeMediaClient:
 
     async def push_audio(self, frame: ProtofaceAudioFrame) -> None:
         await self._audio.put(frame)
+        await self._media.put(frame)
 
     async def push_video(self, frame: ProtofaceVideoFrame) -> None:
         await self._video.put(frame)
+        await self._media.put(frame)
 
     async def close_streams(self) -> None:
         await self._audio.put(None)
         await self._video.put(None)
+        await self._media.put(None)
 
     async def audio_frames(self) -> AsyncIterator[ProtofaceAudioFrame]:
         if self.audio_error is not None:
@@ -118,6 +129,15 @@ class FakeMediaClient:
     async def video_frames(self) -> AsyncIterator[ProtofaceVideoFrame]:
         while True:
             frame = await self._video.get()
+            if frame is None:
+                return
+            yield frame
+
+    async def media_frames(self) -> AsyncIterator[ProtofaceMediaFrame]:
+        if self.audio_error is not None:
+            raise self.audio_error
+        while True:
+            frame = await self._media.get()
             if frame is None:
                 return
             yield frame
@@ -391,6 +411,30 @@ async def test_service_buffers_tts_until_media_client_is_ready() -> None:
     assert client.sent_audio == []
     await _wait_until(lambda: bool(client.sent_audio))
     assert client.sent_audio == [(b"\x00\x00" * 640, 16_000, 1)]
+
+    await client.close_streams()
+    await service.cancel(CancelFrame())
+
+
+@pytest.mark.asyncio
+async def test_service_resamples_queued_tts_to_negotiated_sample_rate() -> None:
+    client = FakeMediaClient(start_delay=0.05, session_input_sample_rate=24_000)
+    service = TestableProtofaceVideoService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+    )
+
+    await service.start(StartFrame())
+    await service.process_frame(
+        TTSAudioRawFrame(audio=b"\x00\x00" * 1280, sample_rate=16_000, num_channels=1),
+        FrameDirection.DOWNSTREAM,
+    )
+    await service.process_frame(TTSStoppedFrame(), FrameDirection.DOWNSTREAM)
+
+    assert client.sent_audio == []
+    await _wait_until(lambda: bool(client.sent_audio))
+    assert client.sent_audio[0][1:] == (24_000, 1)
 
     await client.close_streams()
     await service.cancel(CancelFrame())

@@ -5,7 +5,12 @@ from typing import Any
 
 import aiohttp
 import pytest
-from pipecat_protoface._client import ProtofaceException, ProtofaceRelayClient
+from pipecat_protoface._client import (
+    ProtofaceAudioFrame,
+    ProtofaceException,
+    ProtofaceRelayClient,
+    ProtofaceVideoFrame,
+)
 from pipecat_protoface._media import (
     MediaMessageType,
     decode_media_record,
@@ -203,16 +208,25 @@ async def test_direct_relay_client_consumes_audio_and_video_records() -> None:
 
     audio_iter = client.audio_frames()
     video_iter = client.video_frames()
+    media_iter = client.media_frames()
     audio = await audio_iter.__anext__()
     video = await video_iter.__anext__()
+    first_media = await media_iter.__anext__()
+    second_media = await media_iter.__anext__()
 
     assert audio.audio == b"out"
     assert audio.sample_rate == 16000
     assert audio.transport_source == "protoface-direct"
+    assert audio.sequence_number == 0
     assert video.image == b"\x00\x01\x02\x03\x04\x05"
     assert video.size == (1, 2)
     assert video.pts == 123
     assert video.transport_source == "protoface-direct"
+    assert video.sequence_number == 1
+    assert isinstance(first_media, ProtofaceAudioFrame)
+    assert isinstance(second_media, ProtofaceVideoFrame)
+    assert first_media.sequence_number == 0
+    assert second_media.sequence_number == 1
 
     await client.stop()
 

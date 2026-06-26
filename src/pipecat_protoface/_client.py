@@ -37,6 +37,7 @@ class ProtofaceAudioFrame:
     sample_rate: int
     num_channels: int = 1
     transport_source: str | None = None
+    sequence_number: int | None = None
 
 
 @dataclass(slots=True)
@@ -48,6 +49,10 @@ class ProtofaceVideoFrame:
     format: str = "RGB"
     pts: int | None = None
     transport_source: str | None = None
+    sequence_number: int | None = None
+
+
+ProtofaceMediaFrame = ProtofaceAudioFrame | ProtofaceVideoFrame
 
 
 class ProtofaceMediaClient(Protocol):
@@ -93,6 +98,10 @@ class ProtofaceMediaClient(Protocol):
         """Yield avatar video frames."""
         ...
 
+    def media_frames(self) -> AsyncIterator[ProtofaceMediaFrame]:
+        """Yield avatar media frames in relay receive order."""
+        ...
+
 
 class ProtofaceRelayClient:
     """Client for Protoface Pipecat media sessions.
@@ -125,6 +134,8 @@ class ProtofaceRelayClient:
         self._relay: dict[str, Any] | None = None
         self._audio_queue: asyncio.Queue[ProtofaceAudioFrame | None] = asyncio.Queue()
         self._video_queue: asyncio.Queue[ProtofaceVideoFrame | None] = asyncio.Queue()
+        self._media_queue: asyncio.Queue[ProtofaceMediaFrame | None] = asyncio.Queue()
+        self._media_sequence = 0
 
     @property
     def session_id(self) -> str | None:
@@ -146,6 +157,8 @@ class ProtofaceRelayClient:
         self._media_error = None
         self._audio_queue = asyncio.Queue()
         self._video_queue = asyncio.Queue()
+        self._media_queue = asyncio.Queue()
+        self._media_sequence = 0
         payload: dict[str, Any] = {
             "avatar_id": avatar_id,
             "metadata": dict(metadata or {}),
@@ -238,11 +251,23 @@ class ProtofaceRelayClient:
                 return
             yield frame
 
+    async def _media_frame_iterator(self) -> AsyncIterator[ProtofaceMediaFrame]:
+        while True:
+            frame = await self._media_queue.get()
+            if frame is None:
+                if self._media_error is not None:
+                    raise self._media_error
+                return
+            yield frame
+
     def audio_frames(self) -> AsyncIterator[ProtofaceAudioFrame]:
         return self._audio_frame_iterator()
 
     def video_frames(self) -> AsyncIterator[ProtofaceVideoFrame]:
         return self._video_frame_iterator()
+
+    def media_frames(self) -> AsyncIterator[ProtofaceMediaFrame]:
+        return self._media_frame_iterator()
 
     async def _connect_media_websocket(self, relay: Mapping[str, Any]) -> None:
         media_url = str(relay["media_url"])
@@ -280,26 +305,38 @@ class ProtofaceRelayClient:
         finally:
             await self._audio_queue.put(None)
             await self._video_queue.put(None)
+            await self._media_queue.put(None)
 
     async def _handle_media_record(self, data: bytes) -> None:
         record = decode_media_record(data)
         if record.msg_type is MediaMessageType.AUDIO:
-            await self._audio_queue.put(
-                ProtofaceAudioFrame(
-                    audio=record.blob,
-                    sample_rate=int(record.header.get("sample_rate") or self.input_sample_rate),
-                    num_channels=int(record.header.get("num_channels") or 1),
-                    transport_source="protoface-direct",
-                )
+            audio_frame = ProtofaceAudioFrame(
+                audio=record.blob,
+                sample_rate=int(record.header.get("sample_rate") or self.input_sample_rate),
+                num_channels=int(record.header.get("num_channels") or 1),
+                transport_source="protoface-direct",
+                sequence_number=self._next_media_sequence(),
             )
+            await self._audio_queue.put(audio_frame)
+            await self._media_queue.put(audio_frame)
             return
         if record.msg_type is MediaMessageType.VIDEO:
-            frame = _decode_video_record(record.header, record.blob)
-            await self._video_queue.put(frame)
+            video_frame = _decode_video_record(
+                record.header,
+                record.blob,
+                sequence_number=self._next_media_sequence(),
+            )
+            await self._video_queue.put(video_frame)
+            await self._media_queue.put(video_frame)
             return
         if record.msg_type is MediaMessageType.ERROR:
             message = record.header.get("message") or "Protoface media error"
             raise ProtofaceException(str(message))
+
+    def _next_media_sequence(self) -> int:
+        sequence_number = self._media_sequence
+        self._media_sequence += 1
+        return sequence_number
 
     async def _close_media_websocket(self) -> None:
         task = self._media_task
@@ -355,7 +392,12 @@ async def _read_payload(response: aiohttp.ClientResponse) -> object:
         return {"raw": text}
 
 
-def _decode_video_record(header: Mapping[str, Any], blob: bytes) -> ProtofaceVideoFrame:
+def _decode_video_record(
+    header: Mapping[str, Any],
+    blob: bytes,
+    *,
+    sequence_number: int | None = None,
+) -> ProtofaceVideoFrame:
     encoding = str(header.get("encoding") or "rgb24")
     pts_raw = header.get("timestamp_ms")
     pts = int(pts_raw) if pts_raw is not None else None
@@ -367,6 +409,7 @@ def _decode_video_record(header: Mapping[str, Any], blob: bytes) -> ProtofaceVid
             format="RGB",
             pts=pts,
             transport_source="protoface-direct",
+            sequence_number=sequence_number,
         )
     if encoding == "rgb24":
         width = int(header["width"])
@@ -377,6 +420,7 @@ def _decode_video_record(header: Mapping[str, Any], blob: bytes) -> ProtofaceVid
             format="RGB",
             pts=pts,
             transport_source="protoface-direct",
+            sequence_number=sequence_number,
         )
     raise ProtofaceException(f"Unsupported Protoface video encoding: {encoding!r}")
 
@@ -387,6 +431,7 @@ __all__ = [
     "ProtofaceAudioFrame",
     "ProtofaceException",
     "ProtofaceMediaClient",
+    "ProtofaceMediaFrame",
     "ProtofaceRelayClient",
     "ProtofaceVideoFrame",
 ]
