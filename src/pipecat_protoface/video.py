@@ -46,6 +46,8 @@ _BYTES_PER_SAMPLE = 2
 _DEFAULT_AUDIO_CHUNK_MS = 40
 _DEFAULT_AUDIO_SEND_AHEAD_MS = 1000
 _DEFAULT_CLIENT_READY_TIMEOUT_SECS = 30.0
+_MAX_PENDING_AUDIO_BYTES = 8 * 1024 * 1024
+_MAX_PENDING_AUDIO_EVENTS = 256
 _MAX_PENDING_MEDIA_FRAMES = 64
 
 
@@ -128,6 +130,7 @@ class ProtofaceVideoService(AIService):
         self._fatal_error: Exception | None = None
         self._fatal_error_reported = False
         self._pending_audio_events: list[_PendingAudioEvent] = []
+        self._pending_audio_bytes = 0
         self._pending_media_frames: deque[_PendingMediaFrame] = deque()
         self._audio_state_lock = asyncio.Lock()
         self._media_state_lock = asyncio.Lock()
@@ -202,6 +205,7 @@ class ProtofaceVideoService(AIService):
         self._audio_buffer.clear()
         await self._drain_audio_queue()
         self._pending_audio_events.clear()
+        self._pending_audio_bytes = 0
         self._pending_media_frames.clear()
         self._client_ready_event.clear()
         self._transport_ready = False
@@ -280,13 +284,16 @@ class ProtofaceVideoService(AIService):
         setattr(self, attr, None)
 
     async def _handle_audio_frame(self, frame: TTSAudioRawFrame) -> None:
+        overflow: ProtofaceException | None = None
         async with self._audio_state_lock:
             if self._fatal_error is not None:
                 return
             if not self._client_ready_event.is_set():
-                self._pending_audio_events.append(frame)
-                return
-            await self._enqueue_audio_frame_locked(frame)
+                overflow = self._append_pending_audio_event_locked(frame)
+            else:
+                await self._enqueue_audio_frame_locked(frame)
+        if overflow is not None:
+            await self._fail_fatal("Protoface avatar pending audio buffer overflow", overflow)
 
     async def _enqueue_audio_frame_locked(
         self,
@@ -336,11 +343,15 @@ class ProtofaceVideoService(AIService):
     ) -> None:
         wait_for_client_ready = False
         wait_for_queue = False
+        overflow: ProtofaceException | None = None
         async with self._audio_state_lock:
-            wait_for_client_ready, wait_for_queue = await self._flush_audio_locked(
+            wait_for_client_ready, wait_for_queue, overflow = await self._flush_audio_locked(
                 wait_for_ready=wait_for_ready,
                 enqueue_flush=True,
             )
+        if overflow is not None:
+            await self._fail_fatal("Protoface avatar pending audio buffer overflow", overflow)
+            return
         if wait_for_client_ready:
             if not await self._wait_for_client_ready():
                 if report_ready_timeout:
@@ -370,14 +381,13 @@ class ProtofaceVideoService(AIService):
         wait_for_ready: bool = True,
         enqueue_flush: bool = True,
         drop_if_not_ready: bool = True,
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, ProtofaceException | None]:
         if self._fatal_error is not None:
             self._audio_buffer.clear()
             await self._drain_audio_queue()
-            return False, False
+            return False, False, None
         if wait_for_ready and not self._client_ready_event.is_set():
-            self._pending_audio_events.append(_FlushAudio())
-            return True, False
+            return True, False, self._append_pending_audio_event_locked(_FlushAudio())
         if self._audio_buffer:
             await self._queue.put(
                 _AudioChunk(
@@ -389,7 +399,7 @@ class ProtofaceVideoService(AIService):
             self._audio_buffer.clear()
         if self._send_task is None:
             await self._drain_audio_queue()
-            return False, False
+            return False, False, None
         if (
             drop_if_not_ready
             and not wait_for_ready
@@ -397,10 +407,26 @@ class ProtofaceVideoService(AIService):
             and enqueue_flush
         ):
             await self._drain_audio_queue()
-            return False, False
+            return False, False, None
         if enqueue_flush:
             await self._queue.put(_FlushAudio())
-        return False, enqueue_flush
+        return False, enqueue_flush, None
+
+    def _append_pending_audio_event_locked(
+        self, event: _PendingAudioEvent
+    ) -> ProtofaceException | None:
+        event_bytes = len(event.audio) if isinstance(event, TTSAudioRawFrame) else 0
+        if (
+            len(self._pending_audio_events) >= _MAX_PENDING_AUDIO_EVENTS
+            or self._pending_audio_bytes + event_bytes > _MAX_PENDING_AUDIO_BYTES
+        ):
+            return ProtofaceException(
+                "Buffered Protoface TTS audio exceeded "
+                f"{_MAX_PENDING_AUDIO_EVENTS} events or {_MAX_PENDING_AUDIO_BYTES} bytes."
+            )
+        self._pending_audio_events.append(event)
+        self._pending_audio_bytes += event_bytes
+        return None
 
     async def _handle_interruption(self) -> None:
         await self._interrupt_avatar_output(restart_send_task=True)
@@ -409,6 +435,7 @@ class ProtofaceVideoService(AIService):
         async with self._audio_state_lock:
             self._audio_buffer.clear()
             self._pending_audio_events.clear()
+            self._pending_audio_bytes = 0
             self._next_audio_send_at = 0.0
             self._should_measure_ttfb = False
             self._ttfb_metrics_active = False
@@ -430,6 +457,7 @@ class ProtofaceVideoService(AIService):
             while self._pending_audio_events:
                 pending = self._pending_audio_events
                 self._pending_audio_events = []
+                self._pending_audio_bytes = 0
                 for event in pending:
                     if self._fatal_error is not None:
                         await self._drain_audio_queue()
@@ -641,6 +669,7 @@ class ProtofaceVideoService(AIService):
         async with self._audio_state_lock:
             self._audio_buffer.clear()
             self._pending_audio_events.clear()
+            self._pending_audio_bytes = 0
             self._should_measure_ttfb = False
             self._ttfb_metrics_active = False
             self._resampler = create_stream_resampler()
