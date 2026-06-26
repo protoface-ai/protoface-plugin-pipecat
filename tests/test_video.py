@@ -542,8 +542,10 @@ async def test_service_chunks_audio_and_interrupts() -> None:
 
     assert client.sent_audio == [(b"\x00\x00" * 640, 16_000, 1)]
 
+    resampler = service._resampler
     await service.process_frame(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
     assert client.interrupted == 1
+    assert service._resampler is not resampler
 
     await client.close_streams()
     await service.cancel(CancelFrame())
@@ -634,11 +636,16 @@ async def test_service_preserves_queued_tts_before_ready_tts() -> None:
             self.pending_audio_started = asyncio.Event()
             self.release_pending_audio = asyncio.Event()
 
-        async def _enqueue_audio_frame_locked(self, frame: TTSAudioRawFrame) -> None:
+        async def _enqueue_audio_frame_locked(
+            self,
+            frame: TTSAudioRawFrame,
+            *,
+            drop_if_not_ready: bool = True,
+        ) -> None:
             if not self.pending_audio_started.is_set():
                 self.pending_audio_started.set()
                 await self.release_pending_audio.wait()
-            await super()._enqueue_audio_frame_locked(frame)
+            await super()._enqueue_audio_frame_locked(frame, drop_if_not_ready=drop_if_not_ready)
 
     service = SlowPendingAudioService(
         api_key="sk_test",
@@ -686,13 +693,61 @@ async def test_service_resamples_queued_tts_to_negotiated_sample_rate() -> None:
         TTSAudioRawFrame(audio=b"\x00\x00" * 1280, sample_rate=16_000, num_channels=1),
         FrameDirection.DOWNSTREAM,
     )
-    await service.process_frame(TTSStoppedFrame(), FrameDirection.DOWNSTREAM)
+    stopped_task = asyncio.create_task(
+        service.process_frame(TTSStoppedFrame(), FrameDirection.DOWNSTREAM)
+    )
+    await asyncio.sleep(0.01)
 
     assert client.sent_audio == []
-    await _wait_until(lambda: bool(client.sent_audio))
+    assert not any(isinstance(frame, TTSStoppedFrame) for frame in service.pushed)
+    await asyncio.wait_for(stopped_task, timeout=1.0)
     assert client.sent_audio[0][1:] == (24_000, 1)
+    assert any(isinstance(frame, TTSStoppedFrame) for frame in service.pushed)
 
     await client.close_streams()
+    await service.cancel(CancelFrame())
+
+
+@pytest.mark.asyncio
+async def test_service_tts_stop_does_not_deadlock_on_send_failure() -> None:
+    class BlockingFailSendClient(FakeMediaClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.send_started = asyncio.Event()
+            self.release_send = asyncio.Event()
+
+        async def send_audio(self, audio: bytes, *, sample_rate: int, num_channels: int) -> None:
+            del audio, sample_rate, num_channels
+            self.send_started.set()
+            await self.release_send.wait()
+            raise RuntimeError("send failed")
+
+    client = BlockingFailSendClient()
+    service = TestableProtofaceVideoService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+    )
+
+    await service.start(StartFrame())
+    await _wait_until(lambda: client.started is not None)
+    await service.process_frame(
+        TTSAudioRawFrame(audio=b"\x00\x00" * 640, sample_rate=16_000, num_channels=1),
+        FrameDirection.DOWNSTREAM,
+    )
+    await _wait_until(lambda: client.send_started.is_set())
+
+    stopped_task = asyncio.create_task(
+        service.process_frame(TTSStoppedFrame(), FrameDirection.DOWNSTREAM)
+    )
+    await asyncio.sleep(0.05)
+    assert not stopped_task.done()
+
+    client.release_send.set()
+    await asyncio.wait_for(stopped_task, timeout=1.0)
+    assert any(isinstance(frame, ErrorFrame) for frame in service.pushed)
+    assert client.canceled == 1
+
     await service.cancel(CancelFrame())
 
 

@@ -158,6 +158,7 @@ class ProtofaceVideoService(AIService):
         self._media_generation += 1
         self._should_measure_ttfb = False
         self._ttfb_metrics_active = False
+        self._resampler = create_stream_resampler()
         await self._create_send_task()
         self._connect_task = self.create_task(self._connect_client())
 
@@ -207,6 +208,7 @@ class ProtofaceVideoService(AIService):
         self._next_audio_send_at = 0.0
         self._should_measure_ttfb = False
         self._ttfb_metrics_active = False
+        self._resampler = create_stream_resampler()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         """Process Pipecat frames through the Protoface avatar service."""
@@ -282,7 +284,12 @@ class ProtofaceVideoService(AIService):
                 return
             await self._enqueue_audio_frame_locked(frame)
 
-    async def _enqueue_audio_frame_locked(self, frame: TTSAudioRawFrame) -> None:
+    async def _enqueue_audio_frame_locked(
+        self,
+        frame: TTSAudioRawFrame,
+        *,
+        drop_if_not_ready: bool = True,
+    ) -> None:
         target_sample_rate = self._client.input_sample_rate or PROTOFACE_INPUT_SAMPLE_RATE
         if self._audio_buffer and (
             target_sample_rate != self._audio_buffer_sample_rate
@@ -290,7 +297,8 @@ class ProtofaceVideoService(AIService):
         ):
             await self._flush_audio_locked(
                 wait_for_ready=False,
-                wait_for_queue=self._client_ready_event.is_set(),
+                enqueue_flush=True,
+                drop_if_not_ready=drop_if_not_ready,
             )
         self._audio_buffer_sample_rate = target_sample_rate
         self._audio_buffer_channels = frame.num_channels
@@ -317,22 +325,35 @@ class ProtofaceVideoService(AIService):
             )
 
     async def _flush_audio(self, *, wait_for_ready: bool = True) -> None:
+        wait_for_client_ready = False
+        wait_for_queue = False
         async with self._audio_state_lock:
-            await self._flush_audio_locked(wait_for_ready=wait_for_ready)
+            wait_for_client_ready, wait_for_queue = await self._flush_audio_locked(
+                wait_for_ready=wait_for_ready,
+                enqueue_flush=True,
+            )
+        if wait_for_client_ready:
+            await self._client_ready_event.wait()
+            if self._fatal_error is not None:
+                return
+            wait_for_queue = True
+        if wait_for_queue:
+            await self._queue.join()
 
     async def _flush_audio_locked(
         self,
         *,
         wait_for_ready: bool = True,
-        wait_for_queue: bool = True,
-    ) -> None:
+        enqueue_flush: bool = True,
+        drop_if_not_ready: bool = True,
+    ) -> tuple[bool, bool]:
         if self._fatal_error is not None:
             self._audio_buffer.clear()
             await self._drain_audio_queue()
-            return
+            return False, False
         if wait_for_ready and not self._client_ready_event.is_set():
             self._pending_audio_events.append(_FlushAudio())
-            return
+            return True, False
         if self._audio_buffer:
             await self._queue.put(
                 _AudioChunk(
@@ -344,13 +365,18 @@ class ProtofaceVideoService(AIService):
             self._audio_buffer.clear()
         if self._send_task is None:
             await self._drain_audio_queue()
-            return
-        if not wait_for_ready and not self._client_ready_event.is_set() and wait_for_queue:
+            return False, False
+        if (
+            drop_if_not_ready
+            and not wait_for_ready
+            and not self._client_ready_event.is_set()
+            and enqueue_flush
+        ):
             await self._drain_audio_queue()
-            return
-        await self._queue.put(_FlushAudio())
-        if wait_for_queue:
-            await self._queue.join()
+            return False, False
+        if enqueue_flush:
+            await self._queue.put(_FlushAudio())
+        return False, enqueue_flush
 
     async def _handle_interruption(self) -> None:
         async with self._audio_state_lock:
@@ -359,6 +385,7 @@ class ProtofaceVideoService(AIService):
             self._next_audio_send_at = 0.0
             self._should_measure_ttfb = False
             self._ttfb_metrics_active = False
+            self._resampler = create_stream_resampler()
             await self._cancel_send_task()
             await self._drain_audio_queue()
         async with self._media_state_lock:
@@ -379,11 +406,12 @@ class ProtofaceVideoService(AIService):
                         await self._drain_audio_queue()
                         return
                     if isinstance(event, TTSAudioRawFrame):
-                        await self._enqueue_audio_frame_locked(event)
+                        await self._enqueue_audio_frame_locked(event, drop_if_not_ready=False)
                     else:
                         await self._flush_audio_locked(
                             wait_for_ready=False,
-                            wait_for_queue=False,
+                            enqueue_flush=True,
+                            drop_if_not_ready=False,
                         )
             self._client_ready_event.set()
 
@@ -548,6 +576,7 @@ class ProtofaceVideoService(AIService):
             self._pending_audio_events.clear()
             self._should_measure_ttfb = False
             self._ttfb_metrics_active = False
+            self._resampler = create_stream_resampler()
             await self._drain_audio_queue()
         async with self._media_state_lock:
             self._media_generation += 1
