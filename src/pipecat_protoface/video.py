@@ -128,9 +128,7 @@ class ProtofaceVideoService(AIService):
         self._fatal_error: Exception | None = None
         self._fatal_error_reported = False
         self._pending_audio_events: list[_PendingAudioEvent] = []
-        self._pending_media_frames: deque[_PendingMediaFrame] = deque(
-            maxlen=_MAX_PENDING_MEDIA_FRAMES
-        )
+        self._pending_media_frames: deque[_PendingMediaFrame] = deque()
         self._audio_state_lock = asyncio.Lock()
         self._media_state_lock = asyncio.Lock()
         self._flushing_pending_media = False
@@ -524,24 +522,34 @@ class ProtofaceVideoService(AIService):
     async def _consume_media(self) -> None:
         try:
             async for frame in self._client.media_frames():
+                buffered = False
                 flush_generation: int | None = None
+                overflow: ProtofaceException | None = None
+                generation: int | None = None
                 async with self._media_state_lock:
                     if self._fatal_error is not None:
                         self._client.clear_pending_media()
                         return
                     if not self._transport_ready or self._flushing_pending_media:
-                        self._pending_media_frames.append(frame)
-                        continue
-                    if self._pending_media_frames:
-                        self._pending_media_frames.append(frame)
-                        self._flushing_pending_media = True
-                        flush_generation = self._media_generation
+                        overflow = self._append_pending_media_frame_locked(frame)
+                        buffered = True
+                    elif self._pending_media_frames:
+                        overflow = self._append_pending_media_frame_locked(frame)
+                        if overflow is None:
+                            self._flushing_pending_media = True
+                            flush_generation = self._media_generation
                     else:
                         generation = self._media_generation
+                if overflow is not None:
+                    await self._fail_fatal("Protoface avatar media buffer overflow", overflow)
+                    return
+                if buffered:
+                    continue
                 if flush_generation is not None:
                     await self._flush_pending_media(flush_generation)
                     continue
-                await self._push_media_frame(frame, generation=generation)
+                if generation is not None:
+                    await self._push_media_frame(frame, generation=generation)
             if self._fatal_error is None:
                 await self._fail_fatal(
                     "Protoface avatar media stream ended",
@@ -551,6 +559,16 @@ class ProtofaceVideoService(AIService):
             raise
         except Exception as exc:
             await self._fail_fatal("Protoface avatar media stream failed", exc)
+
+    def _append_pending_media_frame_locked(
+        self, frame: _PendingMediaFrame
+    ) -> ProtofaceException | None:
+        if len(self._pending_media_frames) >= _MAX_PENDING_MEDIA_FRAMES:
+            return ProtofaceException(
+                f"Buffered Protoface avatar media exceeded {_MAX_PENDING_MEDIA_FRAMES} frames."
+            )
+        self._pending_media_frames.append(frame)
+        return None
 
     async def _flush_pending_media(self, generation: int) -> None:
         try:
