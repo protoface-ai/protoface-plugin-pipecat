@@ -47,7 +47,6 @@ example = [
 Documentation = "https://docs.protoface.com"
 Homepage = "https://protoface.com"
 Source = "https://github.com/protoface-ai/protoface-plugin-pipecat"
-Issues = "https://github.com/protoface-ai/protoface-plugin-pipecat/issues"
 
 [tool.hatch.version]
 path = "src/pipecat_protoface/version.py"
