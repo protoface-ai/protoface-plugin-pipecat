@@ -167,8 +167,9 @@ class ProtofaceVideoService(AIService):
         """Stop the hosted Protoface avatar session."""
 
         await super().stop(frame)
-        await self._flush_audio(wait_for_ready=False)
+        await self._flush_audio()
         await self._cancel_connect_task()
+        await self._cancel_task_attr("_media_task")
         await self._client.stop()
         await self._teardown_runtime(cancel_client=False)
 

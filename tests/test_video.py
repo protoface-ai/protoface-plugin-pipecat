@@ -93,6 +93,7 @@ class FakeMediaClient:
 
     async def stop(self) -> None:
         self.stopped += 1
+        await self.close_streams()
 
     async def cancel(self) -> None:
         self.canceled += 1
@@ -281,6 +282,7 @@ async def test_service_starts_and_stops_media_client() -> None:
     await service.stop(EndFrame())
     assert client.flushed == 1
     assert client.stopped == 1
+    assert not any(isinstance(frame, ErrorFrame) for frame in service.pushed)
 
 
 @pytest.mark.asyncio
@@ -623,6 +625,29 @@ async def test_service_buffers_tts_until_media_client_is_ready() -> None:
 
     await client.close_streams()
     await service.cancel(CancelFrame())
+
+
+@pytest.mark.asyncio
+async def test_service_stop_flushes_buffered_tts_after_client_ready() -> None:
+    client = FakeMediaClient(start_delay=0.05)
+    service = TestableProtofaceVideoService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+    )
+
+    await service.start(StartFrame())
+    await service.process_frame(
+        TTSAudioRawFrame(audio=b"\x03\x03" * 640, sample_rate=16_000, num_channels=1),
+        FrameDirection.DOWNSTREAM,
+    )
+
+    await service.stop(EndFrame())
+
+    assert client.sent_audio == [(b"\x03\x03" * 640, 16_000, 1)]
+    assert client.flushed == 1
+    assert client.stopped == 1
+    assert not any(isinstance(frame, ErrorFrame) for frame in service.pushed)
 
 
 @pytest.mark.asyncio
