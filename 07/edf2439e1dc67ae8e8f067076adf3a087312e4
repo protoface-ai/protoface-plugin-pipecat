@@ -1,0 +1,45 @@
+tests/test_client.py
+  s_e57d4c66278a66::t_6d17aa4ed4dddc 8,214
+  s_e57d4c66278a66::t_be732efa0d520f 12,49-50,63-64,150-164,201-209,211-213,215
+  s_e57d4c66278a66::t_50b432aa5a4eda 144,210
+  s_e57d4c66278a66::t_c99b9a37ada76f 216-217
+src/pipecat_protoface/video.py
+  s_e57d4c66278a66::t_1a4bf6532b23df 389-392
+  s_e57d4c66278a66::t_899f6737bf40e3 67-74,114,121-124,141-143,151,154-155,164-165,175,203-205,256,266-276,280-281,308-310,312,314,316-319,321-338,361-370,373-388,393-406,410-418
+  s_e57d4c66278a66::t_c4fb901ff703e2 44,57,345,348-353,355-357
+  s_e57d4c66278a66::t_cb666e9007c186 6
+  s_e57d4c66278a66::t_39796ef91a126c 125,282,315,342-344,346-347,354,358-359,407-409
+tests/test_video.py
+  s_e57d4c66278a66::t_883fc34b00049f 48,84,315-321,323-333
+  s_e57d4c66278a66::t_de3802c81bc3a7 22,322
+  s_e57d4c66278a66::t_68795ba53e89d5 12,34-41,43-45,49,66-67,82-83,85,89,106-107,152-154,261-279,285-287,335-336,362-431,452
+  s_e57d4c66278a66::t_04bbdd5cce7bd7 280-284
+  s_e57d4c66278a66::t_b019ca214f35bb 288-289
+  s_e57d4c66278a66::t_59614072eb64a4 334
+  s_e57d4c66278a66::t_4eaeff38fffa52 337-338
+src/pipecat_protoface/_client.py
+  s_e57d4c66278a66::t_cdfabf1361f002 266
+  s_e57d4c66278a66::t_44e00a0ace05e7 140,173-174
+  s_e57d4c66278a66::t_0eb44f5df4a1c9 124,162-172,175,219-220,228-229,261-265,268-271
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "07edf2439e1dc67ae8e8f067076adf3a087312e4",
+  "prompts": {},
+  "humans": {
+    "h_de56eb73e6f761": {
+      "author": "Protoface Team <295041388+protoface-team@users.noreply.github.com>"
+    }
+  },
+  "sessions": {
+    "s_e57d4c66278a66": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ee77f-f025-7120-879c-a005c5058345",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Protoface Team <295041388+protoface-team@users.noreply.github.com>"
+    }
+  }
+}
