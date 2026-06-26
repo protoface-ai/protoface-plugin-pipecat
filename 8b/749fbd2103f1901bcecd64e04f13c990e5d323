@@ -1,0 +1,28 @@
+src/pipecat_protoface/video.py
+  s_e57d4c66278a66::t_33b39b08ec374d 131,527-528,534,537-540,543-545,563-567,569-571
+  s_e57d4c66278a66::t_b7f86875054881 551-552,568
+  s_e57d4c66278a66::t_f1f5c94902d431 536
+  s_e57d4c66278a66::t_f9f61a517e4d5a 525,535,546-547
+  s_e57d4c66278a66::t_ead92a8c395b6b 572
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "8b749fbd2103f1901bcecd64e04f13c990e5d323",
+  "prompts": {},
+  "humans": {
+    "h_de56eb73e6f761": {
+      "author": "Protoface Team <295041388+protoface-team@users.noreply.github.com>"
+    }
+  },
+  "sessions": {
+    "s_e57d4c66278a66": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ee77f-f025-7120-879c-a005c5058345",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Protoface Team <295041388+protoface-team@users.noreply.github.com>"
+    }
+  }
+}
