@@ -468,6 +468,7 @@ class ProtofaceVideoService(AIService):
         await self._interrupt_avatar_output(restart_send_task=True)
 
     async def _interrupt_avatar_output(self, *, restart_send_task: bool) -> None:
+        await self._cancel_task_attr("_media_task")
         async with self._audio_state_lock:
             self._audio_buffer.clear()
             self._pending_audio_events.clear()
@@ -487,6 +488,8 @@ class ProtofaceVideoService(AIService):
         self._client.clear_pending_media()
         if restart_send_task:
             await self._create_send_task()
+            if self._client_ready_event.is_set() and self._fatal_error is None:
+                await self._create_consume_tasks()
 
     async def _process_pending_audio_events(self) -> None:
         async with self._audio_state_lock:
@@ -585,15 +588,7 @@ class ProtofaceVideoService(AIService):
 
     async def _consume_media(self) -> None:
         try:
-            media_frames = self._client.media_frames().__aiter__()
-            while True:
-                async with self._media_state_lock:
-                    dequeue_generation = self._media_generation
-                try:
-                    frame = await anext(media_frames)
-                except StopAsyncIteration:
-                    break
-
+            async for frame in self._client.media_frames():
                 buffered = False
                 flush_generation: int | None = None
                 overflow: ProtofaceException | None = None
@@ -602,8 +597,6 @@ class ProtofaceVideoService(AIService):
                     if self._fatal_error is not None:
                         self._client.clear_pending_media()
                         return
-                    if dequeue_generation != self._media_generation:
-                        continue
                     if not self._transport_ready or self._flushing_pending_media:
                         overflow = self._append_pending_media_frame_locked(frame)
                         buffered = True
@@ -611,9 +604,9 @@ class ProtofaceVideoService(AIService):
                         overflow = self._append_pending_media_frame_locked(frame)
                         if overflow is None:
                             self._flushing_pending_media = True
-                            flush_generation = dequeue_generation
+                            flush_generation = self._media_generation
                     else:
-                        generation = dequeue_generation
+                        generation = self._media_generation
                 if overflow is not None:
                     await self._fail_fatal("Protoface avatar media buffer overflow", overflow)
                     return
