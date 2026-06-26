@@ -4,11 +4,9 @@ permissions:
   contents: read
 
 on:
+  pull_request:
   push:
     branches: [master]
-  pull_request:
-    branches: [master]
-  workflow_call:
 
 jobs:
   lint-test-build:

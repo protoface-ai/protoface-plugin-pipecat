@@ -60,7 +60,6 @@ include = [
   "/src/pipecat_protoface",
   "/examples",
   "/tests",
-  "/CHANGELOG.md",
   "/README.md",
   "/LICENSE",
   "/env.example",

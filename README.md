@@ -131,8 +131,3 @@ local testing.
 ## License
 
 Apache-2.0 - see [LICENSE](LICENSE)
-
-## Support
-
-- [Protoface documentation](https://docs.protoface.com)
-- [Pipecat Discord](https://discord.gg/pipecat) (`#community-integrations`)

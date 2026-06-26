@@ -102,11 +102,11 @@ class _TestDirectRelayClient(ProtofaceRelayClient):
 def test_relay_client_uses_protoface_api_url_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("PROTOFACE_API_URL", "http://localhost:8000/")
+    monkeypatch.setenv("PROTOFACE_API_URL", "https://api.test.protoface.com/")
 
     client = ProtofaceRelayClient(api_key="sk_test")
 
-    assert client._api_url == "http://localhost:8000"
+    assert client._api_url == "https://api.test.protoface.com"
 
 
 @pytest.mark.asyncio
