@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
     CancelFrame,
     EndFrame,
     ErrorFrame,
@@ -15,6 +16,7 @@ from pipecat.frames.frames import (
     SpeechOutputAudioRawFrame,
     StartFrame,
     TTSAudioRawFrame,
+    TTSStartedFrame,
     TTSStoppedFrame,
     UserStartedSpeakingFrame,
 )
@@ -174,6 +176,8 @@ class TestableProtofaceVideoService(ProtofaceVideoService):
     def __init__(self, **kwargs: object) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
         self.pushed: list[object] = []
+        self.started_ttfb = 0
+        self.stopped_ttfb = 0
 
     def create_task(
         self,
@@ -200,6 +204,14 @@ class TestableProtofaceVideoService(ProtofaceVideoService):
 
     async def push_error_frame(self, frame: ErrorFrame) -> None:
         self.pushed.append(frame)
+
+    async def start_ttfb_metrics(self, *, start_time: float | None = None) -> None:
+        del start_time
+        self.started_ttfb += 1
+
+    async def stop_ttfb_metrics(self, *, end_time: float | None = None) -> None:
+        del end_time
+        self.stopped_ttfb += 1
 
 
 async def _wait_until(predicate: object, *, timeout: float = 1.0) -> None:
@@ -333,6 +345,36 @@ async def test_service_buffers_avatar_media_until_transport_ready() -> None:
             and any(isinstance(frame, OutputImageRawFrame) for frame in service.pushed)
         )
     )
+    await client.close_streams()
+    await service.cancel(CancelFrame())
+
+
+@pytest.mark.asyncio
+async def test_service_stops_ttfb_on_first_avatar_media() -> None:
+    client = FakeMediaClient()
+    service = TestableProtofaceVideoService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+    )
+
+    await service.start(StartFrame())
+    await service.process_frame(OutputTransportReadyFrame(), FrameDirection.DOWNSTREAM)
+    await service.process_frame(TTSStartedFrame(), FrameDirection.DOWNSTREAM)
+    await service.process_frame(BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    await service.process_frame(
+        TTSAudioRawFrame(audio=b"\x00\x00" * 640, sample_rate=16_000, num_channels=1),
+        FrameDirection.DOWNSTREAM,
+    )
+    await _wait_until(lambda: service.started_ttfb == 1)
+
+    assert service.stopped_ttfb == 0
+    assert any(isinstance(frame, TTSStartedFrame) for frame in service.pushed)
+    assert any(isinstance(frame, BotStartedSpeakingFrame) for frame in service.pushed)
+
+    await client.push_audio(ProtofaceAudioFrame(audio=b"\x00\x01", sample_rate=16_000))
+    await _wait_until(lambda: service.stopped_ttfb == 1)
+
     await client.close_streams()
     await service.cancel(CancelFrame())
 
@@ -617,6 +659,7 @@ async def test_service_send_errors_push_fatal_error() -> None:
     )
 
     await service.start(StartFrame())
+    await service.process_frame(OutputTransportReadyFrame(), FrameDirection.DOWNSTREAM)
     await service.process_frame(
         TTSAudioRawFrame(audio=b"\x00\x00" * 640, sample_rate=16_000, num_channels=1),
         FrameDirection.DOWNSTREAM,
@@ -626,6 +669,10 @@ async def test_service_send_errors_push_fatal_error() -> None:
     error = next(frame for frame in service.pushed if isinstance(frame, ErrorFrame))
     assert error.fatal is True
     assert "send failed" in error.error
+
+    await client.push_audio(ProtofaceAudioFrame(audio=b"late", sample_rate=16_000))
+    await asyncio.sleep(0.05)
+    assert not any(isinstance(frame, SpeechOutputAudioRawFrame) for frame in service.pushed)
 
     await client.close_streams()
     await service.cancel(CancelFrame())
@@ -646,6 +693,13 @@ async def test_service_media_errors_push_fatal_error() -> None:
     error = next(frame for frame in service.pushed if isinstance(frame, ErrorFrame))
     assert error.fatal is True
     assert "media failed" in error.error
+
+    await service.process_frame(
+        TTSAudioRawFrame(audio=b"\x00\x00" * 640, sample_rate=16_000, num_channels=1),
+        FrameDirection.DOWNSTREAM,
+    )
+    await asyncio.sleep(0.05)
+    assert client.sent_audio == []
 
     await client.close_streams()
     await service.cancel(CancelFrame())

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json as jsonlib
 import os
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
@@ -409,7 +410,7 @@ async def _read_payload(response: aiohttp.ClientResponse) -> object:
     if not text:
         return {}
     try:
-        return await response.json(content_type=None)
+        return jsonlib.loads(text)
     except ValueError:
         return {"raw": text}
 

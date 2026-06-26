@@ -10,6 +10,7 @@ from pipecat_protoface._client import (
     ProtofaceException,
     ProtofaceRelayClient,
     ProtofaceVideoFrame,
+    _read_payload,
 )
 from pipecat_protoface._media import (
     MediaMessageType,
@@ -73,6 +74,22 @@ class _FakeWebSocketSession:
         self.closed = True
 
 
+class _TextOnlyResponse:
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self.text_calls = 0
+        self.json_calls = 0
+
+    async def text(self) -> str:
+        self.text_calls += 1
+        return self._text
+
+    async def json(self, *, content_type: str | None = None) -> object:
+        del content_type
+        self.json_calls += 1
+        raise AssertionError("response.json() should not be called")
+
+
 class _TestDirectRelayClient(ProtofaceRelayClient):
     def __init__(self, session: _FakeWebSocketSession) -> None:
         super().__init__(
@@ -116,6 +133,17 @@ def test_relay_client_uses_protoface_api_url_env(
     client = ProtofaceRelayClient(api_key="sk_test")
 
     assert client._api_url == "https://api.test.protoface.com"
+
+
+@pytest.mark.asyncio
+async def test_read_payload_parses_response_text_once() -> None:
+    response = _TextOnlyResponse('{"session":{"id":"sess_test"}}')
+
+    payload = await _read_payload(response)  # type: ignore[arg-type]
+
+    assert payload == {"session": {"id": "sess_test"}}
+    assert response.text_calls == 1
+    assert response.json_calls == 0
 
 
 @pytest.mark.asyncio

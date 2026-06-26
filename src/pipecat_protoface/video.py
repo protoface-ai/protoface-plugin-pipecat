@@ -130,6 +130,7 @@ class ProtofaceVideoService(AIService):
         )
         self._next_audio_send_at = 0.0
         self._should_measure_ttfb = False
+        self._ttfb_metrics_active = False
         self._sent_audio_chunks = 0
         self._pushed_audio_frames = 0
         self._pushed_video_frames = 0
@@ -149,6 +150,8 @@ class ProtofaceVideoService(AIService):
         self._transport_ready = False
         self._fatal_error = None
         self._fatal_error_reported = False
+        self._should_measure_ttfb = False
+        self._ttfb_metrics_active = False
         await self._create_send_task()
         self._connect_task = self.create_task(self._connect_client())
 
@@ -195,6 +198,7 @@ class ProtofaceVideoService(AIService):
         self._fatal_error_reported = False
         self._next_audio_send_at = 0.0
         self._should_measure_ttfb = False
+        self._ttfb_metrics_active = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         """Process Pipecat frames through the Protoface avatar service."""
@@ -206,8 +210,8 @@ class ProtofaceVideoService(AIService):
             await self._flush_pending_media()
         elif isinstance(frame, TTSStartedFrame):
             self._should_measure_ttfb = True
+            await self.push_frame(frame, direction)
         elif isinstance(frame, BotStartedSpeakingFrame):
-            await self.stop_ttfb_metrics()
             await self.push_frame(frame, direction)
         elif isinstance(frame, TTSAudioRawFrame):
             await self._handle_audio_frame(frame)
@@ -262,6 +266,8 @@ class ProtofaceVideoService(AIService):
         setattr(self, attr, None)
 
     async def _handle_audio_frame(self, frame: TTSAudioRawFrame) -> None:
+        if self._fatal_error is not None:
+            return
         if not self._client_ready_event.is_set():
             self._pending_audio_events.append(frame)
             return
@@ -299,6 +305,10 @@ class ProtofaceVideoService(AIService):
             )
 
     async def _flush_audio(self, *, wait_for_ready: bool = True) -> None:
+        if self._fatal_error is not None:
+            self._audio_buffer.clear()
+            await self._drain_audio_queue()
+            return
         if wait_for_ready and not self._client_ready_event.is_set():
             self._pending_audio_events.append(_FlushAudio())
             return
@@ -314,9 +324,6 @@ class ProtofaceVideoService(AIService):
         if self._send_task is None:
             await self._drain_audio_queue()
             return
-        if self._fatal_error is not None:
-            await self._drain_audio_queue()
-            return
         if not wait_for_ready and not self._client_ready_event.is_set():
             await self._drain_audio_queue()
             return
@@ -329,6 +336,7 @@ class ProtofaceVideoService(AIService):
         self._pending_media_frames.clear()
         self._next_audio_send_at = 0.0
         self._should_measure_ttfb = False
+        self._ttfb_metrics_active = False
         await self._cancel_send_task()
         await self._drain_audio_queue()
         await self._client.interrupt()
@@ -339,6 +347,9 @@ class ProtofaceVideoService(AIService):
         pending = self._pending_audio_events
         self._pending_audio_events = []
         for event in pending:
+            if self._fatal_error is not None:
+                await self._drain_audio_queue()
+                return
             if isinstance(event, TTSAudioRawFrame):
                 await self._enqueue_audio_frame(event)
             else:
@@ -369,6 +380,9 @@ class ProtofaceVideoService(AIService):
         while True:
             item = await self._queue.get()
             try:
+                if self._fatal_error is not None:
+                    await self._drain_audio_queue()
+                    return
                 if isinstance(item, _AudioChunk):
                     await self._pace_audio_send(item)
                     await self._client.send_audio(
@@ -386,6 +400,7 @@ class ProtofaceVideoService(AIService):
                     if self._should_measure_ttfb:
                         await self.start_ttfb_metrics()
                         self._should_measure_ttfb = False
+                        self._ttfb_metrics_active = True
                 else:
                     await self._client.flush_audio()
             except asyncio.CancelledError:
@@ -418,6 +433,9 @@ class ProtofaceVideoService(AIService):
     async def _consume_media(self) -> None:
         try:
             async for frame in self._client.media_frames():
+                if self._fatal_error is not None:
+                    self._client.clear_pending_media()
+                    return
                 if not self._transport_ready:
                     self._pending_media_frames.append(frame)
                     continue
@@ -434,10 +452,19 @@ class ProtofaceVideoService(AIService):
             await self._push_media_frame(frame)
 
     async def _push_media_frame(self, frame: ProtofaceMediaFrame) -> None:
+        if self._fatal_error is not None:
+            return
+        await self._stop_ttfb_metrics_if_active()
         if isinstance(frame, ProtofaceAudioFrame):
             await self._push_audio_frame(frame)
         else:
             await self._push_video_frame(frame)
+
+    async def _stop_ttfb_metrics_if_active(self) -> None:
+        if not self._ttfb_metrics_active:
+            return
+        self._ttfb_metrics_active = False
+        await self.stop_ttfb_metrics()
 
     async def _push_audio_frame(self, frame: ProtofaceAudioFrame) -> None:
         self._pushed_audio_frames += 1
@@ -459,7 +486,13 @@ class ProtofaceVideoService(AIService):
 
     async def _fail_fatal(self, message: str, exc: Exception) -> None:
         self._fatal_error = exc
+        self._audio_buffer.clear()
         self._pending_audio_events.clear()
+        self._pending_media_frames.clear()
+        self._should_measure_ttfb = False
+        self._ttfb_metrics_active = False
+        await self._drain_audio_queue()
+        self._client.clear_pending_media()
         self._client_ready_event.set()
         if self._fatal_error_reported:
             return
