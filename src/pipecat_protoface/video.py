@@ -296,6 +296,11 @@ class ProtofaceVideoService(AIService):
         setattr(self, attr, None)
 
     async def _handle_audio_frame(self, frame: TTSAudioRawFrame) -> None:
+        invalid_frame = self._validate_audio_frame(frame)
+        if invalid_frame is not None:
+            await self._fail_fatal("Protoface avatar received invalid TTS audio", invalid_frame)
+            return
+
         overflow: ProtofaceException | None = None
         async with self._audio_state_lock:
             if self._fatal_error is not None:
@@ -307,6 +312,13 @@ class ProtofaceVideoService(AIService):
         if overflow is not None:
             await self._fail_fatal("Protoface avatar pending audio buffer overflow", overflow)
 
+    def _validate_audio_frame(self, frame: TTSAudioRawFrame) -> ProtofaceException | None:
+        if frame.sample_rate <= 0:
+            return ProtofaceException(f"Invalid TTS sample rate: {frame.sample_rate}.")
+        if frame.num_channels <= 0:
+            return ProtofaceException(f"Invalid TTS channel count: {frame.num_channels}.")
+        return None
+
     async def _enqueue_audio_frame_locked(
         self,
         frame: TTSAudioRawFrame,
@@ -314,6 +326,8 @@ class ProtofaceVideoService(AIService):
         drop_if_not_ready: bool = True,
     ) -> None:
         target_sample_rate = self._client.input_sample_rate or PROTOFACE_INPUT_SAMPLE_RATE
+        if target_sample_rate <= 0:
+            target_sample_rate = PROTOFACE_INPUT_SAMPLE_RATE
         if self._audio_buffer and (
             target_sample_rate != self._audio_buffer_sample_rate
             or frame.num_channels != self._audio_buffer_channels
@@ -329,12 +343,15 @@ class ProtofaceVideoService(AIService):
         audio = await self._resampler.resample(frame.audio, frame.sample_rate, target_sample_rate)
         self._audio_buffer.extend(audio)
 
-        chunk_size = int(
-            target_sample_rate
-            * max(1, cast(ProtofaceVideoSettings, self._settings).audio_chunk_ms)
-            / 1000
-            * _BYTES_PER_SAMPLE
-            * frame.num_channels
+        bytes_per_sample_frame = _BYTES_PER_SAMPLE * frame.num_channels
+        chunk_size = max(
+            bytes_per_sample_frame,
+            int(
+                target_sample_rate
+                * max(1, cast(ProtofaceVideoSettings, self._settings).audio_chunk_ms)
+                / 1000
+                * bytes_per_sample_frame
+            ),
         )
         while len(self._audio_buffer) >= chunk_size:
             chunk = bytes(self._audio_buffer[:chunk_size])
