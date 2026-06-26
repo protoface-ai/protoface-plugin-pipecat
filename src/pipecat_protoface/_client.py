@@ -306,6 +306,7 @@ class ProtofaceRelayClient:
         ws = self._media_ws
         if ws is None:
             return
+        cancelled = False
         try:
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.BINARY:
@@ -318,13 +319,17 @@ class ProtofaceRelayClient:
                 elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
                     break
         except asyncio.CancelledError:
+            cancelled = True
             raise
         except Exception as exc:
             self._media_error = exc
         finally:
             self._put_bounded(self._audio_queue, None)
             self._put_bounded(self._video_queue, None)
-            self._put_bounded(self._media_queue, None)
+            if cancelled:
+                self._put_bounded(self._media_queue, None)
+            else:
+                await self._media_queue.put(None)
 
     async def _handle_media_record(self, data: bytes) -> None:
         record = decode_media_record(data)
