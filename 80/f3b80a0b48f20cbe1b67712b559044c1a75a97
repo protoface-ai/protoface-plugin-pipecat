@@ -1,0 +1,36 @@
+tests/test_video.py
+  s_e57d4c66278a66::t_c1b6454078a47f 26,42,44,49,61,75-76,79,109,113,118,136-144,419-429,431-432,434-437
+  s_e57d4c66278a66::t_32fd5ae9435480 430
+  s_e57d4c66278a66::t_5fbc6895fcfdac 433
+  s_e57d4c66278a66::t_88318f5050f15c 438-440
+  s_e57d4c66278a66::t_0a51d3dbafeeeb 441-442
+src/pipecat_protoface/video.py
+  s_e57d4c66278a66::t_c8f545ea5ad210 38,74-75,120,125,170,175,186,227,236-237,240,260-265,297-299,323,332-340,412,414,418,428-434,456
+src/pipecat_protoface/_client.py
+  s_e57d4c66278a66::t_660e37d0228fd5 40,52-55,101-104,137-138,160-161,254-262,269-271,308,314-318,325-328,336-340,395-400
+  s_e57d4c66278a66::t_4a950f98f8be9a 412,423,434
+  s_e57d4c66278a66::t_d2d9adf4877f0b 313,320-321,324,329-330
+tests/test_client.py
+  s_e57d4c66278a66::t_b6f5184cc47e0a 8-13,211,214-215,220,225-229
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "80f3b80a0b48f20cbe1b67712b559044c1a75a97",
+  "prompts": {},
+  "humans": {
+    "h_de56eb73e6f761": {
+      "author": "Protoface Team <295041388+protoface-team@users.noreply.github.com>"
+    }
+  },
+  "sessions": {
+    "s_e57d4c66278a66": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ee77f-f025-7120-879c-a005c5058345",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Protoface Team <295041388+protoface-team@users.noreply.github.com>"
+    }
+  }
+}
