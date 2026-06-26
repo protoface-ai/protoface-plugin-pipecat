@@ -947,6 +947,7 @@ async def test_service_cancel_clears_queued_tts_audio() -> None:
         FrameDirection.DOWNSTREAM,
     )
     await service.cancel(CancelFrame())
+    assert client.interrupted == 1
 
     client.start_delay = 0
     await service.start(StartFrame())
@@ -957,6 +958,49 @@ async def test_service_cancel_clears_queued_tts_audio() -> None:
 
     await client.close_streams()
     await service.cancel(CancelFrame())
+
+
+@pytest.mark.asyncio
+async def test_service_stop_does_not_hang_waiting_for_client_ready() -> None:
+    class HungStartClient(FakeMediaClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.start_entered = asyncio.Event()
+            self.release_start = asyncio.Event()
+
+        async def start(
+            self,
+            *,
+            avatar_id: str,
+            max_duration_seconds: int | None = None,
+            metadata: Mapping[str, str | int | float | bool | None] | None = None,
+        ) -> str:
+            del avatar_id, max_duration_seconds, metadata
+            self.starts += 1
+            self.start_entered.set()
+            await self.release_start.wait()
+            return "sess_test"
+
+    client = HungStartClient()
+    service = TestableProtofaceVideoService(
+        api_key="sk_test",
+        avatar_id="av_demo",
+        media_client=client,
+        settings=ProtofaceVideoSettings(client_ready_timeout_secs=0.01),
+    )
+
+    await service.start(StartFrame())
+    await _wait_until(lambda: client.start_entered.is_set())
+    await service.process_frame(
+        TTSAudioRawFrame(audio=b"\x00\x00" * 640, sample_rate=16_000, num_channels=1),
+        FrameDirection.DOWNSTREAM,
+    )
+
+    await asyncio.wait_for(service.stop(EndFrame()), timeout=1.0)
+
+    assert client.sent_audio == []
+    assert client.stopped == 1
+    assert not any(isinstance(frame, ErrorFrame) for frame in service.pushed)
 
 
 @pytest.mark.asyncio

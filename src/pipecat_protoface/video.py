@@ -45,6 +45,7 @@ from ._client import (
 _BYTES_PER_SAMPLE = 2
 _DEFAULT_AUDIO_CHUNK_MS = 40
 _DEFAULT_AUDIO_SEND_AHEAD_MS = 1000
+_DEFAULT_CLIENT_READY_TIMEOUT_SECS = 30.0
 _MAX_PENDING_MEDIA_FRAMES = 64
 
 
@@ -59,6 +60,7 @@ class ProtofaceVideoSettings(ServiceSettings):
 
     audio_chunk_ms: int = _DEFAULT_AUDIO_CHUNK_MS
     audio_send_ahead_ms: int = _DEFAULT_AUDIO_SEND_AHEAD_MS
+    client_ready_timeout_secs: float = _DEFAULT_CLIENT_READY_TIMEOUT_SECS
 
 
 @dataclass(slots=True)
@@ -167,7 +169,7 @@ class ProtofaceVideoService(AIService):
         """Stop the hosted Protoface avatar session."""
 
         await super().stop(frame)
-        await self._flush_audio()
+        await self._flush_audio(report_ready_timeout=False)
         await self._cancel_connect_task()
         await self._cancel_task_attr("_media_task")
         await self._client.stop()
@@ -177,6 +179,8 @@ class ProtofaceVideoService(AIService):
         """Cancel the hosted Protoface avatar session."""
 
         await super().cancel(frame)
+        if self._has_runtime_state():
+            await self._interrupt_avatar_output(restart_send_task=False)
         await self._teardown_runtime(cancel_client=True)
 
     def _has_runtime_state(self) -> bool:
@@ -326,7 +330,12 @@ class ProtofaceVideoService(AIService):
                 )
             )
 
-    async def _flush_audio(self, *, wait_for_ready: bool = True) -> None:
+    async def _flush_audio(
+        self,
+        *,
+        wait_for_ready: bool = True,
+        report_ready_timeout: bool = True,
+    ) -> None:
         wait_for_client_ready = False
         wait_for_queue = False
         async with self._audio_state_lock:
@@ -335,12 +344,27 @@ class ProtofaceVideoService(AIService):
                 enqueue_flush=True,
             )
         if wait_for_client_ready:
-            await self._client_ready_event.wait()
+            if not await self._wait_for_client_ready():
+                if report_ready_timeout:
+                    exc = TimeoutError("Timed out waiting for Protoface avatar session to start.")
+                    await self._cancel_connect_task()
+                    await self._fail_fatal("Protoface avatar session failed to start", exc)
+                return
             if self._fatal_error is not None:
                 return
             wait_for_queue = True
         if wait_for_queue:
             await self._queue.join()
+
+    async def _wait_for_client_ready(self) -> bool:
+        timeout = max(0.0, cast(ProtofaceVideoSettings, self._settings).client_ready_timeout_secs)
+        if timeout <= 0:
+            return self._client_ready_event.is_set()
+        try:
+            await asyncio.wait_for(self._client_ready_event.wait(), timeout=timeout)
+        except TimeoutError:
+            return self._client_ready_event.is_set()
+        return True
 
     async def _flush_audio_locked(
         self,
@@ -381,6 +405,9 @@ class ProtofaceVideoService(AIService):
         return False, enqueue_flush
 
     async def _handle_interruption(self) -> None:
+        await self._interrupt_avatar_output(restart_send_task=True)
+
+    async def _interrupt_avatar_output(self, *, restart_send_task: bool) -> None:
         async with self._audio_state_lock:
             self._audio_buffer.clear()
             self._pending_audio_events.clear()
@@ -394,9 +421,11 @@ class ProtofaceVideoService(AIService):
             self._media_generation += 1
             self._flushing_pending_media = False
             self._pending_media_frames.clear()
-        await self._client.interrupt()
+        with contextlib.suppress(Exception):
+            await self._client.interrupt()
         self._client.clear_pending_media()
-        await self._create_send_task()
+        if restart_send_task:
+            await self._create_send_task()
 
     async def _process_pending_audio_events(self) -> None:
         async with self._audio_state_lock:

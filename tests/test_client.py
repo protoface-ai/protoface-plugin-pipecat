@@ -10,6 +10,7 @@ from pipecat_protoface._client import (
     ProtofaceException,
     ProtofaceRelayClient,
     ProtofaceVideoFrame,
+    _DEFAULT_REQUEST_TIMEOUT_SECONDS,
     _MAX_PENDING_KIND_FRAMES,
     _read_payload,
 )
@@ -134,6 +135,16 @@ def test_relay_client_uses_protoface_api_url_env(
     client = ProtofaceRelayClient(api_key="sk_test")
 
     assert client._api_url == "https://api.test.protoface.com"
+
+
+@pytest.mark.asyncio
+async def test_relay_client_owned_session_has_default_timeout() -> None:
+    client = ProtofaceRelayClient(api_key="sk_test")
+    session = client._ensure_session()
+
+    assert session.timeout.total == _DEFAULT_REQUEST_TIMEOUT_SECONDS
+
+    await session.close()
 
 
 @pytest.mark.asyncio

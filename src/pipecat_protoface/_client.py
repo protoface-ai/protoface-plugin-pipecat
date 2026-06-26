@@ -24,6 +24,7 @@ from pipecat_protoface.version import __version__
 DEFAULT_API_URL = "https://api.protoface.com"
 PROTOFACE_INPUT_SAMPLE_RATE = 16_000
 _USER_AGENT = f"pipecat-protoface/{__version__}"
+_DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 _MAX_PENDING_KIND_FRAMES = 64
 
 
@@ -388,7 +389,9 @@ class ProtofaceRelayClient:
 
     def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None:
-            self._session = aiohttp.ClientSession()
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=_DEFAULT_REQUEST_TIMEOUT_SECONDS)
+            )
         return self._session
 
     async def _json(
