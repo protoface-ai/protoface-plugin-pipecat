@@ -1,6 +1,6 @@
 # Protoface Pipecat Plugin
 
-[![PyPI - Version](https://img.shields.io/pypi/v/pipecat-protoface)](https://pypi.python.org/pypi/pipecat-protoface)
+[![PyPI version](https://img.shields.io/pypi/v/pipecat-protoface?v=2026-06-26)](https://pypi.org/project/pipecat-protoface/)
 
 Add Protoface video avatars to Pipecat pipelines.
 
