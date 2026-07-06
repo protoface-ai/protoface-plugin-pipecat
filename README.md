@@ -6,6 +6,8 @@ Add Protoface video avatars to Pipecat pipelines.
 
 Maintained by [Protoface](https://protoface.com).
 
+Check out the Protoface [Pipecat community docs](https://docs.pipecat.ai/api-reference/server/services/video/protoface).
+
 ## About Protoface
 
 Protoface adds a real-time avatar to your AI app or agent.
