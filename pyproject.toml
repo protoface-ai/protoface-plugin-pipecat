@@ -1,5 +1,6 @@
 [build-system]
-requires = ["hatchling"]
+# hatchling 1.32+ emits Metadata-Version 2.5, which twine 6 and PyPI still reject.
+requires = ["hatchling>=1.27,<1.32"]
 build-backend = "hatchling.build"
 
 [project]
@@ -67,6 +68,12 @@ include = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["README.md"]
+
+[tool.ruff.lint]
+# Keep the historical Ruff defaults. Ruff 0.16 expanded the implicit select
+# set and started failing this repo on import order and broad excepts.
+select = ["E4", "E7", "E9", "F"]
 
 [tool.mypy]
 python_version = "3.11"
