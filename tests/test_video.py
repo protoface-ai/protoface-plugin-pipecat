@@ -200,8 +200,11 @@ class TestableProtofaceVideoService(ProtofaceVideoService):
         del direction
         self.pushed.append(frame)
 
-    async def push_error_frame(self, frame: ErrorFrame) -> None:
-        self.pushed.append(frame)
+    async def push_error_frame(
+        self, error: ErrorFrame, force_treat_as_permanent: bool = False
+    ) -> None:
+        del force_treat_as_permanent
+        self.pushed.append(error)
 
     async def start_ttfb_metrics(self, *, start_time: float | None = None) -> None:
         del start_time
