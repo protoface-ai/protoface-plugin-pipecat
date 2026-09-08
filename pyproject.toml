@@ -68,6 +68,7 @@ include = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["README.md"]
 
 [tool.ruff.lint]
 # Keep the historical Ruff defaults. Ruff 0.16 expanded the implicit select
